@@ -1,0 +1,64 @@
+﻿services:
+  speaches:
+    image: ghcr.io/speaches-ai/speaches:latest-cuda
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      # 0.1.x uses WHISPER__TTL; newer releases use STT_MODEL_TTL.
+      # Setting both makes completed Whisper requests release their GPU model.
+      WHISPER__TTL: "0"
+      STT_MODEL_TTL: "0"
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
+      DO_NOT_TRACK: "1"
+    volumes:
+      - speaches-hf-cache:/home/ubuntu/.cache/huggingface/hub
+    gpus: all
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  washcut-api:
+    build: .
+    ports:
+      - "8787:8787"
+    environment:
+      PORT: "8787"
+      PUBLIC_API_BASE_URL: "http://127.0.0.1:8787"
+      MEDIA_SIGNING_SECRET: "${MEDIA_SIGNING_SECRET:-replace-before-production-32-characters}"
+      WORKER_CONCURRENCY: "1"
+      AUTO_VIDEO_WORKER_CONCURRENCY: "${AUTO_VIDEO_WORKER_CONCURRENCY:-1}"
+      AUTO_VIDEO_ASSET_CONCURRENCY: "${AUTO_VIDEO_ASSET_CONCURRENCY:-2}"
+      AUTO_VIDEO_VISUAL_MAX_RETRIES: "${AUTO_VIDEO_VISUAL_MAX_RETRIES:-2}"
+      DEMO_MODE: "${DEMO_MODE:-true}"
+      SPEACHES_BASE_URL: "${SPEACHES_DOCKER_BASE_URL:-http://speaches:8000/v1}"
+      SPEACHES_API_KEY: "${SPEACHES_API_KEY:-}"
+      SPEACHES_MODEL: "${SPEACHES_MODEL:-Systran/faster-whisper-large-v3}"
+      SPEACHES_TIMEOUT_MS: "${SPEACHES_TIMEOUT_MS:-600000}"
+      SPEACHES_MAX_RETRIES: "${SPEACHES_MAX_RETRIES:-2}"
+      QWEN_ASR_BASE_URL: "${QWEN_ASR_BASE_URL:-}"
+      QWEN_ALIGN_BASE_URL: "${QWEN_ALIGN_BASE_URL:-}"
+      QWEN_ASR_API_KEY: "${QWEN_ASR_API_KEY:-}"
+      QWEN_ASR_MODEL: "${QWEN_ASR_MODEL:-Qwen/Qwen3-ASR-1.7B}"
+      QWEN_ALIGN_MODEL: "${QWEN_ALIGN_MODEL:-Qwen/Qwen3-ForcedAligner-0.6B}"
+      QWEN_ASR_TIMEOUT_MS: "${QWEN_ASR_TIMEOUT_MS:-600000}"
+      QWEN_ASR_MAX_RETRIES: "${QWEN_ASR_MAX_RETRIES:-2}"
+    volumes:
+      - washcut-data:/data
+    depends_on:
+      speaches:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/api/health').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  washcut-data:
+  speaches-hf-cache:
+    name: speaches-hf-cache
+    external: true
+

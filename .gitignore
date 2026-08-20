@@ -1,0 +1,12 @@
+node_modules/
+dist/
+out/
+.env
+data/
+data/uploads/*
+!data/uploads/.gitkeep
+*.log
+qwen3-asr-gateway/.venv/
+qwen3-asr-gateway/.env
+qwen3-asr-gateway/__pycache__/
+
