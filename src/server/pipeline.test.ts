@@ -7,7 +7,7 @@ import type {AssetRef, ProjectInput} from '../shared/contracts.js';
 import type {ModelConversationRecord} from '../shared/model-conversations.js';
 import {prepareProtocolTestMedia} from './media.js';
 import {analyzeAssets, buildAssetManifest, buildCreativeSpec, buildQualityReport, buildVideoSpec, validateVideoSpec} from './pipeline.js';
-import {RelayClient, normalizeModelsUrl, normalizeResponsesUrl, parseModelJson, parseModelList, parseSseText} from './relay-client.js';
+import {RelayClient, RelayError, isRetryableRelayFailureMessage, normalizeModelsUrl, normalizeResponsesUrl, parseModelJson, parseModelList, parseSseText} from './relay-client.js';
 
 const assets: AssetRef[] = [
   {assetId: 'a1', fileName: '门店.jpg', sha256: '11111111', contentType: 'image/jpeg', sizeBytes: 100, width: 1080, height: 1920, sourceType: 'user_upload', status: 'ready', keyframeUrls: ['http://example.test/a1.jpg']},
@@ -77,6 +77,15 @@ test('SSE parser requires response.completed', () => {
   assert.throws(() => parseSseText('data: [DONE]\n\n'), /response.completed/);
 });
 
+test('SSE stream_timeout remains relay_failed but is classified as retryable', () => {
+  assert.equal(isRetryableRelayFailureMessage('stream_timeout'), true);
+  assert.equal(isRetryableRelayFailureMessage('invalid_request_error'), false);
+  assert.throws(
+    () => parseSseText('data: {"type":"response.failed","response":{"error":{"message":"stream_timeout"}}}\n\n'),
+    (error) => error instanceof RelayError && error.code === 'relay_failed' && error.message === 'stream_timeout' && error.retryable,
+  );
+});
+
 test('SSE parser supports CRLF and multiline data frames', () => {
   const body = 'data: {"type":"response.output_text.delta",\r\ndata: "delta":"pong"}\r\n\r\ndata: {"type":"response.completed"}\r\n\r\n';
   assert.equal(parseSseText(body), 'pong');
@@ -131,9 +140,11 @@ test('relay chat sends recent user and assistant messages using Responses conten
   try {
     const address = server.address();
     if (!address || typeof address === 'string') throw new Error('mock_server_address_invalid');
+    const deltas: string[] = [];
     const reply = await new RelayClient({baseUrl: `http://127.0.0.1:${address.port}`, apiKey: 'test-chat-key', model: 'test-chat-model'})
-      .requestChat([{role: 'user', content: 'ping'}, {role: 'assistant', content: 'previous'}, {role: 'user', content: 'again'}]);
+      .requestChat([{role: 'user', content: 'ping'}, {role: 'assistant', content: 'previous'}, {role: 'user', content: 'again'}], [], undefined, undefined, (delta) => deltas.push(delta));
     assert.equal(reply, 'pong');
+    assert.deepEqual(deltas, ['pong']);
     assert.equal(authorization, 'Bearer test-chat-key');
     assert.equal(requestBody?.model, 'test-chat-model');
     assert.equal(requestBody?.stream, true);
@@ -235,6 +246,91 @@ test('relay conversation audit stores the complete text exchange without embeddi
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
+});
+
+test('relay reads SSE incrementally and records first-byte and first-event metrics', async () => {
+  const records: ModelConversationRecord[] = [];
+  const server = createServer((_request, response) => {
+    response.writeHead(200, {'content-type': 'text/event-stream'});
+    setTimeout(() => {
+      response.write('data: {"type":"response.output_text.delta","delta":"chunked"}\n\n');
+      setTimeout(() => response.end('data: {"type":"response.completed"}\n\n'), 10);
+    }, 20);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('mock_server_address_invalid');
+    const relay = new RelayClient(
+      {baseUrl: `http://127.0.0.1:${address.port}`, apiKey: 'test-stream-key', model: 'test-stream-model', firstByteTimeoutMs: 500, idleTimeoutMs: 500, totalTimeoutMs: 1_000},
+      {tenantId: 'tenant_test', onRecord: (record) => records.push(record)},
+    );
+    assert.equal(await relay.requestMultimodalText('stream', []), 'chunked');
+    assert.equal(records.length, 1);
+    assert.ok(records[0]!.timeToFirstByteMs !== undefined);
+    assert.ok(records[0]!.timeToFirstEventMs !== undefined);
+    assert.ok(records[0]!.latencyMs >= records[0]!.timeToFirstEventMs!);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test('relay conversation audit forwards SSE text deltas to one streaming record', async () => {
+  const progress: ModelConversationRecord[] = [];
+  const final: ModelConversationRecord[] = [];
+  const server = createServer((_request, response) => {
+    response.writeHead(200, {'content-type': 'text/event-stream'});
+    response.write('data: {"type":"response.output_text.delta","delta":"part-a"}\n\n');
+    setTimeout(() => response.end('data: {"type":"response.output_text.delta","delta":"part-b"}\n\ndata: {"type":"response.completed"}\n\n'), 10);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('mock_server_address_invalid');
+    const relay = new RelayClient(
+      {baseUrl: `http://127.0.0.1:${address.port}`, apiKey: 'test-stream-audit-key', model: 'test-stream-audit-model'},
+      {tenantId: 'tenant_test', onRecord: (record) => final.push(record), onProgress: (record) => progress.push(record)},
+    );
+    assert.equal(await relay.requestMultimodalText('stream audit', []), 'part-apart-b');
+    assert.ok(progress.length >= 2);
+    assert.ok(progress.every((record) => record.status === 'streaming'));
+    assert.equal(new Set(progress.map((record) => record.id)).size, 1);
+    assert.equal(progress.at(-1)?.responseText, 'part-apart-b');
+    assert.equal(final.length, 1);
+    assert.equal(final[0]?.id, progress[0]?.id);
+    assert.equal(final[0]?.responseText, 'part-apart-b');
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test('relay timeout phase distinguishes first byte, idle gap and total duration', async () => {
+  const runTimeoutCase = async (writeResponse: (response: import('node:http').ServerResponse) => void, config: {firstByteTimeoutMs: number; idleTimeoutMs: number; totalTimeoutMs: number}, expectedCode: string, expectedPhase: 'first_byte' | 'idle' | 'total') => {
+    const server = createServer((_request, response) => {
+      response.on('error', () => undefined);
+      writeResponse(response);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('mock_server_address_invalid');
+      const relay = new RelayClient({baseUrl: `http://127.0.0.1:${address.port}`, apiKey: 'test-timeout-key', model: 'test-timeout-model', ...config});
+      await assert.rejects(() => relay.requestMultimodalText('timeout', []), (error: unknown) => error instanceof RelayError && error.code === expectedCode && error.metrics?.timeoutPhase === expectedPhase);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  };
+  await runTimeoutCase((response) => setTimeout(() => response.end('data: [DONE]\n\n'), 80), {firstByteTimeoutMs: 20, idleTimeoutMs: 200, totalTimeoutMs: 300}, 'relay_first_byte_timeout', 'first_byte');
+  await runTimeoutCase((response) => {
+    response.writeHead(200, {'content-type': 'text/event-stream'});
+    response.write('data: {"type":"response.output_text.delta","delta":"x"}\n\n');
+    setTimeout(() => response.end('data: {"type":"response.completed"}\n\n'), 80);
+  }, {firstByteTimeoutMs: 200, idleTimeoutMs: 20, totalTimeoutMs: 300}, 'relay_idle_timeout', 'idle');
+  await runTimeoutCase((response) => {
+    response.writeHead(200, {'content-type': 'text/event-stream'});
+    response.write('data: {"type":"response.output_text.delta","delta":"x"}\n\n');
+    setTimeout(() => response.end('data: {"type":"response.completed"}\n\n'), 80);
+  }, {firstByteTimeoutMs: 200, idleTimeoutMs: 200, totalTimeoutMs: 20}, 'relay_total_timeout', 'total');
 });
 
 test('protocol tester samples the reported Pexels MP4 into three JPEG image inputs', async () => {

@@ -4,7 +4,12 @@ import {mkdtemp, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import {normalizeQwenAlignedResponse, Qwen3AsrTranscriptionProvider} from './qwen3-asr.js';
+import {
+  normalizeQwenAlignedResponse,
+  parseQwenVocabularyProfile,
+  QWEN_ASR_DEFAULT_VOCABULARY_PROFILE,
+  Qwen3AsrTranscriptionProvider,
+} from './qwen3-asr.js';
 import {TranscriptionProviderError} from './transcription-provider.js';
 
 const snapshot = {
@@ -12,7 +17,7 @@ const snapshot = {
   model: 'Qwen/Qwen3-ASR-1.7B',
   alignmentModel: 'Qwen/Qwen3-ForcedAligner-0.6B',
   language: 'zh' as const,
-  vocabularyProfile: 'car-wash-zh-v1' as const,
+  vocabularyProfile: 'car-wash-ad-zh-v2' as const,
   audioProfile: 'mono-16khz-pcm-s16le-v1' as const,
   chunkingProfile: 'vad-overlap-30s-v1' as const,
 };
@@ -33,6 +38,18 @@ test('Qwen provider is explicitly unavailable without its private gateway config
   assert.equal(status.ready, false);
   assert.equal(status.error?.code, 'QWEN_ASR_NOT_CONFIGURED');
   assert.equal(status.supportsWordTimestamps, false);
+});
+
+test('Qwen vocabulary profiles default to the ad context while preserving the legacy profile', () => {
+  assert.equal(QWEN_ASR_DEFAULT_VOCABULARY_PROFILE, 'car-wash-ad-zh-v2');
+  assert.equal(parseQwenVocabularyProfile(undefined), 'car-wash-ad-zh-v2');
+  assert.equal(parseQwenVocabularyProfile('car-wash-zh-v1'), 'car-wash-zh-v1');
+  assert.throws(
+    () => parseQwenVocabularyProfile('unknown-profile'),
+    (error: unknown) => error instanceof TranscriptionProviderError
+      && error.code === 'QWEN_ASR_VOCABULARY_PROFILE_UNSUPPORTED'
+      && error.retryable === false,
+  );
 });
 
 test('Qwen aligned transcript requires real word and segment timestamps', () => {
@@ -56,6 +73,7 @@ test('Qwen aligned transcript requires real word and segment timestamps', () => 
 test('Qwen provider calls ASR then aligner and preserves alignment upstream errors', async () => {
   let failAlignment = false;
   let loaded = false;
+  let transcribeRequestBody = '';
   const {server, baseUrl} = await listen((request, response) => {
     const url = new URL(request.url ?? '/', baseUrl);
     if (url.pathname === '/internal/asr/qwen3/health') {
@@ -76,8 +94,12 @@ test('Qwen provider calls ASR then aligner and preserves alignment upstream erro
       return;
     }
     if (url.pathname === '/internal/asr/qwen3/transcribe') {
-      response.setHeader('content-type', 'application/json');
-      response.end(JSON.stringify({text: '精洗套餐今天优惠', language: 'zh', serviceVersion: 'asr-test'}));
+      request.setEncoding('utf8');
+      request.on('data', (chunk) => { transcribeRequestBody += chunk; });
+      request.on('end', () => {
+        response.setHeader('content-type', 'application/json');
+        response.end(JSON.stringify({text: '精洗套餐今天优惠', language: 'zh', serviceVersion: 'asr-test'}));
+      });
       return;
     }
     if (url.pathname === '/internal/asr/qwen3/align') {
@@ -98,12 +120,14 @@ test('Qwen provider calls ASR then aligner and preserves alignment upstream erro
   try {
     await writeFile(audioPath, Buffer.from('RIFF----WAVEfmt '));
     const provider = new Qwen3AsrTranscriptionProvider({baseUrl, timeoutMs: 5_000, maxRetries: 0});
+    assert.equal(provider.createSnapshot().vocabularyProfile, 'car-wash-ad-zh-v2');
     assert.equal((await provider.status()).ready, false);
     const status = await provider.start();
     assert.equal(status.ready, true);
     assert.equal(status.providerServiceVersion, 'asr=asr-test;aligner=align-test');
     const result = await provider.transcribeWithRaw({assetId: 'asset_qwen', filePath: audioPath, durationMs: 2_000, snapshot});
     assert.equal(result.transcript.text, '精洗套餐今天优惠');
+    assert.match(transcribeRequestBody, /name="vocabularyProfile"\r\n\r\ncar-wash-ad-zh-v2/);
     assert.deepEqual(Object.keys(result.raw as object), ['transcribe', 'align']);
     failAlignment = true;
     await assert.rejects(

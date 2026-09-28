@@ -1,4 +1,4 @@
-import {createHash, createHmac, timingSafeEqual} from 'node:crypto';
+import {createHash, createHmac, randomUUID, timingSafeEqual} from 'node:crypto';
 import {createReadStream} from 'node:fs';
 import {access, mkdir, open, readFile, rename, rm, stat, writeFile} from 'node:fs/promises';
 import path from 'node:path';
@@ -6,7 +6,9 @@ import {spawn} from 'node:child_process';
 import sharp from 'sharp';
 import {
   assetMetadataSchema,
+  videoTimelineSchema,
   type AssetMetadata,
+  type AutoCaption,
   type StoredAutoVideoAsset,
   type StoredVideoScreenshot,
   type VideoTimeline,
@@ -41,7 +43,11 @@ const runMedia = (command: string, args: string[], options: {timeoutMs?: number;
     options.signal?.removeEventListener('abort', abort);
     if (options.signal?.aborted) reject(new Error('cancelled'));
     else if (code === 0) resolve({stdout, stderr});
-    else reject(new Error(`${path.basename(command)}_failed:${stderr.slice(-8_000)}`));
+    else {
+      const error = new Error(`${path.basename(command)}_failed:${stderr.slice(-8_000)}`) as Error & {code: string};
+      error.code = `${path.basename(command)}_failed`;
+      reject(error);
+    }
   });
 });
 
@@ -308,7 +314,7 @@ export const screenshotAsDataUrl = async (screenshot: StoredVideoScreenshot) => 
 export const writeProjectJson = async (projectId: string, fileName: string, value: unknown) => {
   const target = autoVideoProjectArtifactPath(projectId, fileName);
   await mkdir(path.dirname(target), {recursive: true});
-  const temporary = `${target}.${process.pid}.tmp`;
+  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(temporary, JSON.stringify(value, null, 2), 'utf8');
   await rename(temporary, target);
   return target;
@@ -317,7 +323,7 @@ export const writeProjectJson = async (projectId: string, fileName: string, valu
 export const writeGenerationJson = async (projectId: string, generationId: string, fileName: string, value: unknown) => {
   const target = autoVideoGenerationArtifactPath(projectId, generationId, fileName);
   await mkdir(path.dirname(target), {recursive: true});
-  const temporary = `${target}.${process.pid}.tmp`;
+  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(temporary, JSON.stringify(value, null, 2), 'utf8');
   await rename(temporary, target);
   return target;
@@ -341,7 +347,9 @@ export const cleanupAssetAnalysisFiles = async (asset: StoredAutoVideoAsset) => 
   return {...asset, temporaryAudioPath: undefined, screenshots: [], contactSheetPath: undefined};
 };
 
-const signatureFor = (projectId: string, resource: 'original' | 'output' | 'captions', expires: number, assetId?: string, generationId?: string) =>
+type AutoVideoSignedResource = 'original' | 'output' | 'captioned-output' | 'captions';
+
+const signatureFor = (projectId: string, resource: AutoVideoSignedResource, expires: number, assetId?: string, generationId?: string) =>
   createHmac('sha256', signingSecret).update(`auto-video:${projectId}:${generationId ?? ''}:${resource}:${assetId ?? ''}:${expires}`).digest('hex');
 
 const publicBaseUrl = () => process.env.PUBLIC_API_BASE_URL ?? `http://127.0.0.1:${process.env.PORT ?? 8787}`;
@@ -357,12 +365,14 @@ export const signedAutoVideoUrl = (projectId: string, resource: 'original' | 'ou
   return `${publicBaseUrl()}${base}?expires=${expires}&signature=${signature}`;
 };
 
-export const signedAutoVideoGenerationUrl = (projectId: string, generationId: string, resource: 'output' | 'captions', options: {ttlSeconds?: number} = {}) => {
+export const signedAutoVideoGenerationUrl = (projectId: string, generationId: string, resource: 'output' | 'captioned-output' | 'captions', options: {ttlSeconds?: number} = {}) => {
   const expires = Math.floor(Date.now() / 1_000) + (options.ttlSeconds ?? 6 * 60 * 60);
   const signature = signatureFor(projectId, resource, expires, undefined, generationId);
   const base = resource === 'output'
     ? `/api/projects/${encodeURIComponent(projectId)}/generations/${encodeURIComponent(generationId)}/output.mp4`
-    : `/api/projects/${encodeURIComponent(projectId)}/generations/${encodeURIComponent(generationId)}/captions.vtt`;
+    : resource === 'captioned-output'
+      ? `/api/projects/${encodeURIComponent(projectId)}/generations/${encodeURIComponent(generationId)}/output-captioned.mp4`
+      : `/api/projects/${encodeURIComponent(projectId)}/generations/${encodeURIComponent(generationId)}/captions.vtt`;
   return `${publicBaseUrl()}${base}?expires=${expires}&signature=${signature}`;
 };
 
@@ -374,7 +384,7 @@ export const verifyAutoVideoSignature = (projectId: string, resource: 'original'
   return timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
 };
 
-export const verifyAutoVideoGenerationSignature = (projectId: string, generationId: string, resource: 'output' | 'captions', expiresValue: unknown, signatureValue: unknown) => {
+export const verifyAutoVideoGenerationSignature = (projectId: string, generationId: string, resource: 'output' | 'captioned-output' | 'captions', expiresValue: unknown, signatureValue: unknown) => {
   const expires = Number(expiresValue);
   const signature = String(signatureValue ?? '');
   if (!Number.isInteger(expires) || expires < Math.floor(Date.now() / 1_000) || !/^[a-f0-9]{64}$/.test(signature)) return false;
@@ -420,10 +430,27 @@ export const renderAutoVideo = async (projectId: string, timeline: VideoTimeline
   return outputPath;
 };
 
-export const renderAutoVideoGeneration = async (projectId: string, generationId: string, timeline: VideoTimeline, signal?: AbortSignal) => {
-  const propsPath = await writeGenerationJson(projectId, generationId, 'render-props.json', {timeline});
-  const outputPath = autoVideoGenerationArtifactPath(projectId, generationId, 'output.mp4');
-  const pendingPath = autoVideoGenerationArtifactPath(projectId, generationId, 'output.next.mp4');
+const renderAutoVideoGenerationFile = async (
+  projectId: string,
+  generationId: string,
+  timeline: VideoTimeline,
+  captions: AutoCaption[],
+  showSubtitles: boolean,
+  fileName: 'output.mp4' | 'output-captioned.mp4',
+  signal?: AbortSignal,
+) => {
+  const stem = showSubtitles ? 'captioned' : 'plain';
+  const refreshedTimeline = videoTimelineSchema.parse({
+    ...timeline,
+    clips: timeline.clips.map((clip) => ({
+      ...clip,
+      src: signedAutoVideoUrl(projectId, 'original', {assetId: clip.assetId}),
+    })),
+  });
+  const propsPath = await writeGenerationJson(projectId, generationId, `render-props-${stem}.json`, {timeline: refreshedTimeline, captions, showSubtitles});
+  const outputPath = autoVideoGenerationArtifactPath(projectId, generationId, fileName);
+  const pendingPath = autoVideoGenerationArtifactPath(projectId, generationId, showSubtitles ? 'output-captioned.next.mp4' : 'output.next.mp4');
+  const backupPath = autoVideoGenerationArtifactPath(projectId, generationId, showSubtitles ? 'output-captioned.previous.mp4' : 'output.previous.mp4');
   await mkdir(path.dirname(outputPath), {recursive: true});
   await rm(pendingPath, {force: true}).catch(() => undefined);
   try {
@@ -433,15 +460,58 @@ export const renderAutoVideoGeneration = async (projectId: string, generationId:
       {timeoutMs: 30 * 60_000, signal},
     );
     await stat(pendingPath);
-    await rename(pendingPath, outputPath);
   } catch (error) {
     await rm(pendingPath, {force: true}).catch(() => undefined);
     throw error;
   } finally {
     await rm(propsPath, {force: true}).catch(() => undefined);
   }
+  let previousMoved = false;
+  try {
+    await rm(backupPath, {force: true});
+    if (await access(outputPath).then(() => true).catch(() => false)) {
+      await rename(outputPath, backupPath);
+      previousMoved = true;
+    }
+    await rename(pendingPath, outputPath);
+    await rm(backupPath, {force: true});
+  } catch (error) {
+    if (previousMoved && await access(backupPath).then(() => true).catch(() => false) && !(await access(outputPath).then(() => true).catch(() => false))) {
+      await rename(backupPath, outputPath).catch(() => undefined);
+    }
+    await rm(pendingPath, {force: true}).catch(() => undefined);
+    throw error;
+  }
   return outputPath;
 };
+
+export const renderAutoVideoGenerationCaptioned = async (
+  projectId: string,
+  generationId: string,
+  timeline: VideoTimeline,
+  captions: AutoCaption[],
+  signal?: AbortSignal,
+) => renderAutoVideoGenerationFile(projectId, generationId, timeline, captions, true, 'output-captioned.mp4', signal);
+
+export const renderAutoVideoGeneration = async (
+  projectId: string,
+  generationId: string,
+  timeline: VideoTimeline,
+  captions: AutoCaption[],
+  signal?: AbortSignal,
+) => {
+  const outputPath = await renderAutoVideoGenerationFile(projectId, generationId, timeline, captions, false, 'output.mp4', signal);
+  await renderAutoVideoGenerationCaptioned(projectId, generationId, timeline, captions, signal);
+  return outputPath;
+};
+
+export const renderAutoVideoGenerationPlain = async (
+  projectId: string,
+  generationId: string,
+  timeline: VideoTimeline,
+  captions: AutoCaption[],
+  signal?: AbortSignal,
+) => renderAutoVideoGenerationFile(projectId, generationId, timeline, captions, false, 'output.mp4', signal);
 
 export const inspectAutoVideoOutput = async (projectId: string) => {
   const outputPath = autoVideoProjectArtifactPath(projectId, 'output.mp4');
@@ -452,7 +522,8 @@ export const inspectAutoVideoOutput = async (projectId: string) => {
 
 export const inspectAutoVideoGenerationOutput = async (projectId: string, generationId: string) => {
   const outputPath = autoVideoGenerationArtifactPath(projectId, generationId, 'output.mp4');
+  const captionedOutputPath = autoVideoGenerationArtifactPath(projectId, generationId, 'output-captioned.mp4');
   const metadata = await probeAutoVideo(`output_${generationId}`, outputPath);
-  const info = await stat(outputPath);
-  return {outputPath, metadata, fileSize: info.size};
+  const [info, captionedInfo] = await Promise.all([stat(outputPath), stat(captionedOutputPath)]);
+  return {outputPath, captionedOutputPath, metadata, fileSize: info.size, captionedFileSize: captionedInfo.size};
 };

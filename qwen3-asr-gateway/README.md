@@ -18,8 +18,7 @@ The gateway never logs audio bytes, transcript contents, or API keys.
 ## Models
 
 The ASR and forced-aligner models must be two independent, complete model
-snapshots. The existing `D:\短视频\model` directory is a Whisper large-v3
-snapshot, not a Qwen snapshot, and must not be moved or overwritten.
+snapshots under `D:\短视频\model`.
 
 Set `QWEN_ASR_MODEL_PATH` and `QWEN_ALIGN_MODEL_PATH` to the actual local
 snapshot directories. The model IDs reported by health must remain the exact
@@ -39,10 +38,14 @@ python -m uvicorn app:app --host 127.0.0.1 --port 8010
 
 For GPU inference, install a PyTorch build matching the installed CUDA driver
 before installing `qwen-asr` if the package does not install the desired build.
-Keep this lightweight gateway process running while using the app. Health is
-passive and never loads either model. Clicking **启用** for Qwen calls `load`;
-switching away calls `unload`, waits for active inference to finish, drops both
-model references, runs Python garbage collection and clears the CUDA cache.
+The main app can start this local gateway on demand when the Qwen **启动网关**
+button is clicked. On Windows, if the restricted app process cannot load
+PyTorch (`WinError 5`), the app invokes `start-qwen-gateway.ps1`, which asks for
+UAC approval and starts the gateway in an administrator process. Health is
+passive and never loads either model. After the gateway becomes reachable, the app calls `load`; switching away calls `unload`,
+waits for active inference to finish, drops both model references, runs Python
+garbage collection and clears the CUDA cache. Manual startup with the command
+above remains supported.
 
 ## Contract notes
 
@@ -55,10 +58,18 @@ model references, runs Python garbage collection and clears the CUDA cache.
 - Transcribe and align reject requests until `load` succeeds. `unload` returns
   `gpuMemoryReleased` plus the process CUDA allocated/reserved byte counts; the
   main app will not activate another model unless release is confirmed.
-- The `vocabularyProfile` and `chunkingProfile` fields are accepted as
-  versioned request metadata. They are not silently treated as custom model
-  prompts; custom vocabulary behavior must be added only after a real Qwen
-  evaluation proves it.
+- `car-wash-zh-v1` is the historical no-context vocabulary profile. New
+  generations use `car-wash-ad-zh-v2`, a server-owned list of common car-wash
+  service, construction, detailing, result, and conversion terms. The gateway
+  passes its short, space-separated text to the official
+  `Qwen3ASRModel.transcribe(context=...)` argument. Unknown non-empty profiles
+  fail with `QWEN_ASR_VOCABULARY_PROFILE_UNSUPPORTED`; browsers cannot provide
+  arbitrary prompts.
+- Vocabulary profile names are immutable. Add a new version when changing the
+  term set so historical generation retries keep their original behavior.
+- `context` biases recognition but is not a forced dictionary. Keep terms
+  short and evaluate real positive and negative audio because excessive context
+  can leak into transcription output.
 
 The implementation follows the official Qwen3-ASR examples in the upstream
 repository, including `Qwen3ASRModel.from_pretrained`,

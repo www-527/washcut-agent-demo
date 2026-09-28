@@ -1,6 +1,6 @@
 import {useEffect, useRef, useState, type ChangeEvent, type DragEvent, type FormEvent, type KeyboardEvent} from 'react';
 import type {EnvelopeContext, RelayChatMessage, RelayKeySummary} from '../../shared/contracts';
-import {chatWithRelayKey} from '../api';
+import {streamChatWithRelayKey} from '../api';
 import {AttachmentIcon, ShieldIcon, SparkIcon} from './Icons';
 
 type ChatAttachment = {
@@ -58,10 +58,14 @@ export function RelayChatTester({relayKey, context, onClose}: RelayChatTesterPro
     setImages([]);
     setSending(true);
     setError('');
+    const assistantId = crypto.randomUUID();
+    const assistantMessage: DisplayMessage = {id: assistantId, role: 'assistant', content: ''};
+    setMessages((current) => [...current, assistantMessage].slice(-24));
     try {
-      const result = await chatWithRelayKey(relayKey.keyId, requestMessages, selectedImages.map((image) => image.file), context);
-      const assistantMessage: DisplayMessage = {id: crypto.randomUUID(), role: 'assistant', content: result.reply};
-      setMessages((current) => [...current, assistantMessage].slice(-24));
+      const result = await streamChatWithRelayKey(relayKey.keyId, requestMessages, selectedImages.map((image) => image.file), context, (delta) => {
+        setMessages((current) => current.map((message) => message.id === assistantId ? {...message, content: `${message.content}${delta}`} : message));
+      });
+      setMessages((current) => current.map((message) => message.id === assistantId ? {...message, content: result.reply} : message));
       setLastLatency(result.latencyMs);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : '模型对话失败。');

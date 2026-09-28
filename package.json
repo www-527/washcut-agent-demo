@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently -k -n api,web -c blue,cyan \"pnpm dev:server\" \"pnpm dev:web\"",
-    "dev:server": "tsx watch src/server/index.ts",
+    "dev:server": "tsx watch src/server/bootstrap.ts",
     "dev:web": "vite",
+    "dev:test-gateway": "tsx watch src/server/test-gateway-bootstrap.ts",
     "build": "tsc -b && vite build",
-    "start": "tsx src/server/index.ts",
+    "start": "tsx src/server/bootstrap.ts",
+    "start:test-gateway": "tsx src/server/test-gateway-bootstrap.ts",
     "test": "tsx --test src/server/*.test.ts",
     "remotion:studio": "remotion studio src/remotion/index.ts --no-open",
     "render:demo": "remotion render src/remotion/index.ts WashcutMarketingVideo out/washcut-demo.mp4"

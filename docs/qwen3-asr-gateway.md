@@ -4,10 +4,10 @@
 
 ## 1. 先整理当前下载的模型
 
-当前 `D:\短视频\model` 不应同时作为 Whisper（CTranslate2）与两个 Qwen 模型的目录。Qwen 模型除 `.safetensors` 权重外还需要对应仓库中的 `config.json`、tokenizer / processor 文件，以及多分片模型的索引文件。请保留原文件，不要覆盖；在补齐模型文件后整理为：
+`D:\短视频\model` 只存放两个相互独立的 Qwen 完整模型快照。Qwen 模型除 `.safetensors` 权重外还需要对应仓库中的 `config.json`、tokenizer / processor 文件，以及多分片模型的索引文件：
 
 ```text
-D:\短视频\models\
+D:\短视频\model\
   qwen3-asr-1.7b\                 # Qwen/Qwen3-ASR-1.7B 的完整仓库快照
     config.json
     model.safetensors.index.json   # 多分片时必须存在
@@ -18,7 +18,6 @@ D:\短视频\models\
     config.json
     model.safetensors
     ... tokenizer / processor 等其余文件
-  whisper-large-v3-ctranslate2\   # 原 Speaches / faster-whisper 文件，保持独立
 ```
 
 官方模型页：
@@ -90,7 +89,7 @@ ASR、对齐器都必须是 `ready: true` 且模型名与配置精确一致，�
 }
 ```
 
-对于非空文本，词级和片段级时间戳都缺失或无效即视为失败；主应用不会生成估算时间戳，更不会回退到 Whisper。
+对于非空文本，词级和片段级时间戳都缺失或无效即视为失败；主应用不会生成估算时间戳或切换到其他转写实现。
 
 ### 错误格式
 
@@ -106,6 +105,5 @@ ASR、对齐器都必须是 `ready: true` 且模型名与配置精确一致，�
 
 1. 启动网关，并确认 health 响应中两个模型均就绪。
 2. 在 `.env` 填写 Qwen 环境变量后启动应用。
-3. 打开“创建智能编排版本”，确认 Qwen 按钮可选；未就绪时应显示网关原始错误。
-4. 用一段有口播的洗车素材创建 Qwen 版本，检查版本详情中的锁定快照、原始转写工件、字幕与时间轴。
-5. 再以 Whisper 创建新版本进行人工 A/B 对比。Qwen 未完成真实洗车素材评测前仍保持 Whisper 为默认。
+3. 打开转文字模型设置，确认 Qwen 已启用；未就绪时应显示网关原始错误并允许重试。
+4. 用一段有口播的洗车素材创建版本，检查版本详情中的锁定快照、原始转写工件、字幕与时间轴。

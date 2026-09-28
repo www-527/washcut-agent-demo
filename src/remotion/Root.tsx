@@ -33,10 +33,14 @@ export const RemotionRoot = () => (
       height={1920}
       fps={30}
       durationInFrames={30}
-      defaultProps={{timeline: {
-        projectId: 'project_preview', fps: 30, width: 1080, height: 1920, durationInFrames: 30, durationMs: 1_000,
-        clips: [{assetId: 'asset_preview', src: 'https://remotion.media/video.mp4', order: 1, startMs: 0, durationMs: 1_000, fromFrame: 0, durationInFrames: 30, volume: 1, fit: 'contain'}],
-      } satisfies VideoTimeline}}
+      defaultProps={{
+        timeline: {
+          projectId: 'project_preview', fps: 30, width: 1080, height: 1920, durationInFrames: 30, durationMs: 1_000,
+          clips: [{assetId: 'asset_preview', src: 'https://remotion.media/video.mp4', order: 1, startMs: 0, durationMs: 1_000, fromFrame: 0, durationInFrames: 30, volume: 1, fit: 'contain'}],
+        } satisfies VideoTimeline,
+        captions: [],
+        showSubtitles: false,
+      }}
       calculateMetadata={calculateAutoVideoMetadata}
     />
   </>

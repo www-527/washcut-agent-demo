@@ -13,25 +13,109 @@ import {autoVideoGenerationArtifactPath, autoVideoProjectArtifactPath, writeGene
 const maxCaptionCharacters = 14;
 const maxCaptionDurationMs = 1_800;
 const maxWordGapMs = 500;
+const minimumBalancedCaptionCharacters = 3;
+const orphanMergeDurationToleranceMs = 250;
 const sentenceEnd = /[。！？!?；;]/u;
 
+const captionCharacterCount = (text: string) => Array.from(text).length;
+
+const rebalanceTrailingTextOrphan = (chunks: string[]) => {
+  if (chunks.length < 2) return chunks;
+  const balanced = [...chunks];
+  const orphan = balanced[balanced.length - 1]!;
+  const previous = balanced[balanced.length - 2]!;
+  if (
+    captionCharacterCount(orphan) >= minimumBalancedCaptionCharacters
+    || sentenceEnd.test(previous.at(-1) ?? '')
+  ) return balanced;
+  if (captionCharacterCount(previous) + captionCharacterCount(orphan) <= maxCaptionCharacters) {
+    balanced.splice(-2, 2, `${previous}${orphan}`);
+    return balanced;
+  }
+  const previousCharacters = Array.from(previous);
+  const orphanCharacters = Array.from(orphan);
+  while (
+    orphanCharacters.length < minimumBalancedCaptionCharacters
+    && previousCharacters.length > minimumBalancedCaptionCharacters
+  ) {
+    orphanCharacters.unshift(previousCharacters.pop()!);
+  }
+  balanced.splice(-2, 2, previousCharacters.join(''), orphanCharacters.join(''));
+  return balanced;
+};
+
+const splitCaptionText = (text: string) => {
+  const chunks: string[] = [];
+  let current: string[] = [];
+  const flush = () => {
+    const value = current.join('').trim();
+    if (value) chunks.push(value);
+    current = [];
+  };
+  for (const character of Array.from(text.trim())) {
+    if (!character.trim() && current.length === 0) continue;
+    current.push(character);
+    if (current.length >= maxCaptionCharacters || sentenceEnd.test(character)) flush();
+  }
+  flush();
+  return rebalanceTrailingTextOrphan(chunks);
+};
+
+const captionWordGroupText = (group: NormalizedTranscript['words']) =>
+  group.map((word) => word.text.trim()).join('');
+
+const rebalanceWordTimedOrphans = (groups: NormalizedTranscript['words'][]) => {
+  const balanced = groups.map((group) => [...group]);
+  for (let index = 1; index < balanced.length; index += 1) {
+    const previous = balanced[index - 1];
+    const orphan = balanced[index];
+    if (!previous?.length || !orphan?.length) continue;
+    if (captionCharacterCount(captionWordGroupText(orphan)) >= minimumBalancedCaptionCharacters) continue;
+    const previousLast = previous[previous.length - 1]!;
+    const orphanFirst = orphan[0]!;
+    const orphanLast = orphan[orphan.length - 1]!;
+    if (
+      sentenceEnd.test(previousLast.text.trim())
+      || orphanFirst.startMs - previousLast.endMs > maxWordGapMs
+    ) continue;
+
+    const combinedText = `${captionWordGroupText(previous)}${captionWordGroupText(orphan)}`;
+    const combinedDurationMs = orphanLast.endMs - previous[0]!.startMs;
+    if (
+      captionCharacterCount(combinedText) <= maxCaptionCharacters
+      && combinedDurationMs <= maxCaptionDurationMs + orphanMergeDurationToleranceMs
+    ) {
+      previous.push(...orphan);
+      balanced.splice(index, 1);
+      index -= 1;
+      continue;
+    }
+
+    while (captionCharacterCount(captionWordGroupText(orphan)) < minimumBalancedCaptionCharacters) {
+      const candidate = previous[previous.length - 1];
+      if (!candidate) break;
+      const candidateCharacters = captionCharacterCount(candidate.text.trim());
+      const remainingPreviousCharacters = captionCharacterCount(captionWordGroupText(previous)) - candidateCharacters;
+      const rebalancedOrphanCharacters = captionCharacterCount(captionWordGroupText(orphan)) + candidateCharacters;
+      const rebalancedOrphanDurationMs = orphanLast.endMs - candidate.startMs;
+      if (
+        remainingPreviousCharacters < minimumBalancedCaptionCharacters
+        || rebalancedOrphanCharacters > maxCaptionCharacters
+        || rebalancedOrphanDurationMs > maxCaptionDurationMs + orphanMergeDurationToleranceMs
+      ) break;
+      previous.pop();
+      orphan.unshift(candidate);
+    }
+  }
+  return balanced;
+};
+
 const wordTimedCaptions = (transcript: NormalizedTranscript): AutoCaption[] => {
-  const captions: AutoCaption[] = [];
+  const groups: NormalizedTranscript['words'][] = [];
   let group: typeof transcript.words = [];
   const flush = () => {
     if (!group.length) return;
-    const first = group[0]!;
-    const last = group[group.length - 1]!;
-    const text = group.map((word) => word.text.trim()).join('');
-    if (text && first.startMs < last.endMs) {
-      captions.push(autoCaptionSchema.parse({
-        text,
-        startMs: first.startMs,
-        endMs: last.endMs,
-        timestampMs: first.startMs,
-        confidence: first.confidence,
-      }));
-    }
+    groups.push(group);
     group = [];
   };
   for (const word of transcript.words) {
@@ -41,7 +125,7 @@ const wordTimedCaptions = (transcript: NormalizedTranscript): AutoCaption[] => {
     const previous = group[group.length - 1];
     const nextText = `${group.map((item) => item.text.trim()).join('')}${text}`;
     const startsNewCaption = Boolean(first && (
-      nextText.length > maxCaptionCharacters
+      captionCharacterCount(nextText) > maxCaptionCharacters
       || word.endMs - first.startMs > maxCaptionDurationMs
       || word.startMs - (previous?.endMs ?? word.startMs) > maxWordGapMs
     ));
@@ -50,7 +134,19 @@ const wordTimedCaptions = (transcript: NormalizedTranscript): AutoCaption[] => {
     if (sentenceEnd.test(text)) flush();
   }
   flush();
-  return captions;
+  return rebalanceWordTimedOrphans(groups).flatMap((balancedGroup) => {
+    const first = balancedGroup[0];
+    const last = balancedGroup[balancedGroup.length - 1];
+    const text = captionWordGroupText(balancedGroup);
+    if (!first || !last || !text || first.startMs >= last.endMs) return [];
+    return [autoCaptionSchema.parse({
+      text,
+      startMs: first.startMs,
+      endMs: last.endMs,
+      timestampMs: first.startMs,
+      confidence: first.confidence,
+    })];
+  });
 };
 
 export const transcriptToCaptions = (assetId: string, transcript: NormalizedTranscript | null): AssetCaptionTrack => {
@@ -59,13 +155,21 @@ export const transcriptToCaptions = (assetId: string, transcript: NormalizedTran
   const captions = transcript.segments.flatMap((source) => {
     const text = source.text.trim();
     if (!text || source.startMs >= source.endMs || source.endMs > transcript.durationMs) return [];
-    return [autoCaptionSchema.parse({
-      text,
-      startMs: source.startMs,
-      endMs: source.endMs,
-      timestampMs: source.startMs,
-      confidence: source.confidence,
-    })];
+    const chunks = splitCaptionText(text);
+    const durationMs = source.endMs - source.startMs;
+    if (chunks.length <= 1 || durationMs < chunks.length) {
+      return [autoCaptionSchema.parse({text, startMs: source.startMs, endMs: source.endMs, timestampMs: source.startMs, confidence: source.confidence})];
+    }
+    const characterCount = chunks.reduce((total, chunk) => total + captionCharacterCount(chunk), 0);
+    let elapsedCharacters = 0;
+    return chunks.map((chunk, index) => {
+      const startMs = source.startMs + Math.round(durationMs * elapsedCharacters / characterCount);
+      elapsedCharacters += captionCharacterCount(chunk);
+      const endMs = index === chunks.length - 1
+        ? source.endMs
+        : source.startMs + Math.round(durationMs * elapsedCharacters / characterCount);
+      return autoCaptionSchema.parse({text: chunk, startMs, endMs, timestampMs: startMs, confidence: source.confidence});
+    });
   });
   return assetCaptionTrackSchema.parse({assetId, captions});
 };

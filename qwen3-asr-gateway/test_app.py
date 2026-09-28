@@ -1,9 +1,10 @@
+from io import BytesIO
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
 import app as gateway
-from app import GatewayError, _alignment_payload
+from app import GatewayError, _alignment_payload, _vocabulary_context
 
 
 class AlignmentPayloadTest(TestCase):
@@ -71,3 +72,56 @@ class ModelLifecycleTest(TestCase):
         self.assertFalse(payload["ready"])
         self.assertTrue(payload["gpuMemoryReleased"])
         self.assertEqual(payload["gpuMemory"], {"allocatedBytes": 0, "reservedBytes": 0})
+
+
+class VocabularyContextTest(TestCase):
+    def test_legacy_profile_stays_empty_and_new_profile_contains_ad_terms(self) -> None:
+        self.assertEqual(_vocabulary_context("car-wash-zh-v1"), ("car-wash-zh-v1", ""))
+
+        profile, context = _vocabulary_context("car-wash-ad-zh-v2")
+
+        self.assertEqual(profile, "car-wash-ad-zh-v2")
+        self.assertIn("脚垫", context)
+        self.assertIn("门把手", context)
+        self.assertIn("龙卷风清洁枪", context)
+        self.assertIn("洗车套餐", context)
+        self.assertEqual(len(gateway.CAR_WASH_AD_ZH_V2_TERMS), len(set(gateway.CAR_WASH_AD_ZH_V2_TERMS)))
+
+    def test_rejects_unknown_profile_without_rewriting_the_error(self) -> None:
+        with self.assertRaises(GatewayError) as raised:
+            _vocabulary_context("unknown-profile")
+
+        self.assertEqual(raised.exception.code, "QWEN_ASR_VOCABULARY_PROFILE_UNSUPPORTED")
+        self.assertFalse(raised.exception.retryable)
+
+    def test_transcribe_passes_versioned_context_to_official_qwen_api(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeAsr:
+            def transcribe(self, **kwargs: object) -> list[SimpleNamespace]:
+                captured.update(kwargs)
+                return [SimpleNamespace(text="脚垫拆下来", language="Chinese")]
+
+        upload = gateway.UploadFile(filename="audio.wav", file=BytesIO(b"RIFF-test"))
+        with (
+            patch.object(gateway, "_require_models_loaded", return_value=(FakeAsr(), object())),
+            patch.object(gateway, "_with_audio_file", side_effect=lambda data, callback: callback("audio.wav")),
+        ):
+            payload = gateway.transcribe(
+                audio=upload,
+                language="zh",
+                model=gateway.ASR_MODEL_ID,
+                vocabularyProfile="car-wash-ad-zh-v2",
+                chunkingProfile="vad-overlap-30s-v1",
+                requestId="asset:test",
+                authorization=None,
+                x_api_key=None,
+            )
+
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(captured["audio"], "audio.wav")
+        self.assertEqual(captured["language"], "Chinese")
+        self.assertIn("脚垫", str(captured["context"]))
+        self.assertFalse(captured["return_time_stamps"])
+        self.assertEqual(payload["vocabularyProfile"], "car-wash-ad-zh-v2")
+        self.assertTrue(payload["contextApplied"])

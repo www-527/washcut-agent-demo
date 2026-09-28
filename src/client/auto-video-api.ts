@@ -7,17 +7,17 @@
   AutoVideoOutput,
   AutoVideoProjectCreate,
   AutoVideoProjectStatus,
-  TranscriptionProviderStatus,
   TranscriptionProviderStatusResponse,
 } from '../shared/auto-video-contracts';
 
-export type AutoVideoAssetView = AutoVideoAsset & {originalUrl: string; duplicateOfAssetId?: string};
-export type AutoVideoOutputView = AutoVideoOutput & {videoUrl?: string; subtitleUrl?: string};
+export type AutoVideoAssetView = AutoVideoAsset & {originalUrl: string};
+export type AutoVideoOutputView = AutoVideoOutput & {videoUrl?: string; captionedVideoUrl?: string; subtitleUrl?: string};
 export type AutoVideoGenerationView = Omit<AutoVideoGeneration, 'output'> & {output?: AutoVideoOutputView; assetCheckpoints?: AutoVideoAssetCheckpointSummary[]};
 export type AutoVideoGenerationSummary = Pick<AutoVideoGeneration,
   'generationId' | 'projectId' | 'versionNumber' | 'status' | 'progress' | 'aiMode' |
-  'connectionId' | 'model' | 'createdAt' | 'startedAt' | 'completedAt' | 'updatedAt'
+  'connectionId' | 'model' | 'reasoningEffort' | 'createdAt' | 'startedAt' | 'completedAt' | 'updatedAt'
 >;
+export type AutoVideoGenerationProgress = Pick<AutoVideoGeneration, 'generationId' | 'projectId' | 'status' | 'progress' | 'steps' | 'retryState' | 'error' | 'updatedAt'> & {currentStep?: string};
 
 export type AutoVideoProjectDetail = {
   id: string;
@@ -47,9 +47,7 @@ export type ModelConnectionStatus = {
   message: string;
 };
 
-export type TranscriptionStatus = TranscriptionProviderStatus;
 export type {TranscriptionProviderStatusResponse};
-
 
 const headers = () => ({
   'x-tenant-id': 'tenant_demo',
@@ -57,14 +55,30 @@ const headers = () => ({
   'x-role': 'producer',
 });
 
+export class AutoVideoApiError extends Error {
+  readonly code?: string;
+  readonly retryable?: boolean;
+  readonly stage?: string;
+  readonly details?: unknown;
+  readonly traceId?: string;
+  constructor(message: string, payload?: Record<string, unknown>) {
+    super(message);
+    this.name = 'AutoVideoApiError';
+    this.code = typeof payload?.code === 'string' ? payload.code : undefined;
+    this.retryable = typeof payload?.retryable === 'boolean' ? payload.retryable : undefined;
+    this.stage = typeof payload?.stage === 'string' ? payload.stage : undefined;
+    this.details = payload?.details;
+    this.traceId = typeof payload?.traceId === 'string' ? payload.traceId : undefined;
+  }
+}
+
 const readJson = async <Value>(response: Response): Promise<Value> => {
   const raw = await response.text();
   let body: unknown;
   try { body = raw ? JSON.parse(raw) : undefined; } catch { body = undefined; }
   if (!response.ok) {
-    const message = body && typeof body === 'object' && 'error' in body
-      && (body as {error?: {message?: unknown}}).error?.message;
-    throw new Error(typeof message === 'string' ? message : raw || response.statusText);
+    const failure = body && typeof body === 'object' && 'error' in body ? (body as {error?: Record<string, unknown>}).error : undefined;
+    throw new AutoVideoApiError(typeof failure?.message === 'string' ? failure.message : raw || response.statusText, failure);
   }
   return body as Value;
 };
@@ -80,8 +94,8 @@ export const listAutoVideoProjects = async () => {
 
 export const getAutoVideoProject = async (projectId: string) => readJson<AutoVideoProjectDetail>(await fetch(`/api/projects/${encodeURIComponent(projectId)}`, {headers: headers()}));
 
-export const duplicateAutoVideoProject = async (projectId: string) => readJson<AutoVideoProjectDetail>(await fetch(`/api/projects/${encodeURIComponent(projectId)}/duplicate`, {
-  method: 'POST', headers: headers(),
+export const deleteAutoVideoProject = async (projectId: string) => readJson<{accepted: boolean}>(await fetch(`/api/projects/${encodeURIComponent(projectId)}`, {
+  method: 'DELETE', headers: headers(),
 }));
 
 export const uploadAutoVideoAssets = async (projectId: string, files: File[]) => {
@@ -98,18 +112,18 @@ export const deleteAutoVideoAsset = async (projectId: string, assetId: string) =
 
 export const getModelConnectionStatus = async () => readJson<ModelConnectionStatus>(await fetch('/api/model-connection/status', {headers: headers()}));
 
-export const getTranscriptionStatus = async () => readJson<TranscriptionStatus>(await fetch('/api/transcription/status', {headers: headers()}));
-
 export const getTranscriptionProviders = async () => readJson<TranscriptionProviderStatusResponse>(await fetch('/api/transcription/providers', {headers: headers()}));
 
-export const activateTranscriptionProvider = async (providerId: 'speaches-whisper' | 'qwen3-asr') => readJson<TranscriptionProviderStatusResponse>(await fetch('/api/transcription/activate', {
+export const activateTranscriptionProvider = async (providerId: 'qwen3-asr') => readJson<TranscriptionProviderStatusResponse>(await fetch('/api/transcription/activate', {
   method: 'POST',
   headers: {...headers(), 'content-type': 'application/json'},
   body: JSON.stringify({providerId}),
 }));
 
-export const startTranscription = async () => readJson<TranscriptionStatus>(await fetch('/api/transcription/start', {
-  method: 'POST', headers: headers(),
+export const deactivateTranscriptionProvider = async (providerId: 'qwen3-asr') => readJson<TranscriptionProviderStatusResponse>(await fetch('/api/transcription/deactivate', {
+  method: 'POST',
+  headers: {...headers(), 'content-type': 'application/json'},
+  body: JSON.stringify({providerId}),
 }));
 
 export const createAutoVideoGeneration = async (projectId: string, input: AutoVideoGenerationCreate, idempotencyKey: string) => readJson<{accepted: boolean; generation: AutoVideoGenerationView}>(await fetch(`/api/projects/${encodeURIComponent(projectId)}/generations`, {
@@ -124,6 +138,11 @@ export const listAutoVideoGenerations = async (projectId: string) => {
 };
 
 export const getAutoVideoGeneration = async (projectId: string, generationId: string) => readJson<AutoVideoGenerationView>(await fetch(`/api/projects/${encodeURIComponent(projectId)}/generations/${encodeURIComponent(generationId)}`, {headers: headers()}));
+export const getAutoVideoGenerationProgress = async (projectId: string, generationId: string) => readJson<AutoVideoGenerationProgress>(await fetch(`/api/projects/${encodeURIComponent(projectId)}/generations/${encodeURIComponent(generationId)}/progress`, {headers: headers()}));
+
+export const prepareCaptionedAutoVideoOutput = async (projectId: string, generationId: string) => readJson<{videoUrl: string}>(await fetch(`/api/projects/${encodeURIComponent(projectId)}/generations/${encodeURIComponent(generationId)}/output-captioned`, {
+  method: 'POST', headers: headers(),
+}));
 
 export const deleteAutoVideoGeneration = async (projectId: string, generationId: string) => readJson<{accepted: boolean; project: AutoVideoProjectDetail}>(await fetch(`/api/projects/${encodeURIComponent(projectId)}/generations/${encodeURIComponent(generationId)}`, {
   method: 'DELETE', headers: headers(),

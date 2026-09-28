@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,7 +15,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SERVICE_VERSION = "qwen3-asr-gateway-0.2.0"
+SERVICE_VERSION = "qwen3-asr-gateway-0.3.0"
 ASR_MODEL_ID = os.getenv("QWEN_ASR_MODEL_ID", "Qwen/Qwen3-ASR-1.7B")
 ALIGN_MODEL_ID = os.getenv("QWEN_ALIGN_MODEL_ID", "Qwen/Qwen3-ForcedAligner-0.6B")
 ASR_MODEL_PATH = os.getenv("QWEN_ASR_MODEL_PATH", ASR_MODEL_ID)
@@ -26,8 +27,69 @@ DTYPE_NAME = os.getenv("QWEN_DTYPE", "bfloat16").strip().lower()
 MAX_INFERENCE_BATCH_SIZE = int(os.getenv("QWEN_MAX_INFERENCE_BATCH_SIZE", "1"))
 MAX_NEW_TOKENS = int(os.getenv("QWEN_MAX_NEW_TOKENS", "256"))
 
+CAR_WASH_AD_ZH_V2_TERMS = (
+    "洗车",
+    "精洗",
+    "汽车美容",
+    "外观清洗",
+    "内饰清洁",
+    "泡沫预洗",
+    "高压水枪",
+    "车身冲洗",
+    "脚垫",
+    "地毯",
+    "座椅",
+    "皮革座椅",
+    "顶棚",
+    "方向盘",
+    "仪表台",
+    "中控台",
+    "出风口",
+    "门把手",
+    "车门饰板",
+    "储物槽",
+    "脚踏板",
+    "后备箱",
+    "细节刷",
+    "软毛刷",
+    "清洁剂",
+    "内饰毛巾",
+    "龙卷风清洁枪",
+    "全车吸尘",
+    "除尘",
+    "除味",
+    "轮胎",
+    "轮毂",
+    "轮胎上蜡",
+    "轮胎保养",
+    "打蜡",
+    "抛光",
+    "镀晶",
+    "漆面",
+    "格栅",
+    "玻璃油膜",
+    "水渍",
+    "污渍",
+    "洗车套餐",
+    "到店",
+    "下单",
+    "团购",
+    "优惠",
+    "体验",
+)
+
+VOCABULARY_CONTEXTS = {
+    # Historical generations used this profile when the gateway accepted the
+    # field as metadata only. Keep it empty so retries remain reproducible.
+    "car-wash-zh-v1": "",
+    # Qwen's official API accepts short domain vocabulary through `context`.
+    "car-wash-ad-zh-v2": " ".join(CAR_WASH_AD_ZH_V2_TERMS),
+}
+
 app = FastAPI(title="Qwen3 ASR private gateway", version=SERVICE_VERSION)
 _model_lock = threading.Lock()
+_shutdown_lock = threading.Lock()
+_shutdown_started = False
 _inference_lock = threading.Lock()
 _asr_model: Any | None = None
 _align_model: Any | None = None
@@ -79,6 +141,19 @@ def _language(value: str | None) -> str | None:
         "ko": "Korean",
         "korean": "Korean",
     }.get(normalized, value.strip() if value and value.strip() else None)
+
+
+def _vocabulary_context(profile: str | None) -> tuple[str | None, str]:
+    normalized = (profile or "").strip()
+    if not normalized:
+        return None, ""
+    if normalized not in VOCABULARY_CONTEXTS:
+        raise GatewayError(
+            "QWEN_ASR_VOCABULARY_PROFILE_UNSUPPORTED",
+            f"Unsupported vocabulary profile: {normalized!r}",
+            False,
+        )
+    return normalized, VOCABULARY_CONTEXTS[normalized]
 
 
 def _dtype(torch: Any) -> Any:
@@ -217,6 +292,22 @@ def _unload_models() -> dict[str, Any]:
     }
 
 
+def _exit_gateway_after_unload() -> None:
+    # Give FastAPI enough time to flush the accepted response before stopping.
+    time.sleep(0.5)
+    try:
+        _unload_models()
+    finally:
+        os._exit(0)
+
+
+def _force_gateway_exit() -> None:
+    # Inference is synchronous and may hold the unload lock. The gateway is
+    # stateless, so a bounded process exit is the final GPU-release guarantee.
+    time.sleep(15)
+    os._exit(0)
+
+
 def _read_upload(upload: UploadFile) -> bytes:
     data = upload.file.read(MAX_UPLOAD_BYTES + 1)
     if len(data) > MAX_UPLOAD_BYTES:
@@ -330,6 +421,24 @@ def unload(
         return _error_response(exc, 401 if exc.code == "QWEN_GATEWAY_UNAUTHORIZED" else 503)
 
 
+@app.post("/internal/asr/qwen3/shutdown", response_model=None)
+def shutdown(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None),
+) -> dict[str, Any] | JSONResponse:
+    global _shutdown_started
+    try:
+        _check_api_key(authorization, x_api_key)
+        with _shutdown_lock:
+            if not _shutdown_started:
+                _shutdown_started = True
+                threading.Thread(target=_exit_gateway_after_unload, daemon=True).start()
+                threading.Thread(target=_force_gateway_exit, daemon=True).start()
+        return {"accepted": True, "gatewayStopping": True, "serviceVersion": SERVICE_VERSION}
+    except GatewayError as exc:
+        return _error_response(exc, 401 if exc.code == "QWEN_GATEWAY_UNAUTHORIZED" else 503)
+
+
 @app.post("/internal/asr/qwen3/transcribe", response_model=None)
 def transcribe(
     audio: UploadFile = File(...),
@@ -341,20 +450,37 @@ def transcribe(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None),
 ) -> dict[str, Any] | JSONResponse:
-    del vocabularyProfile, chunkingProfile, requestId
+    del chunkingProfile, requestId
     try:
         _check_api_key(authorization, x_api_key)
         if model != ASR_MODEL_ID:
             raise GatewayError("QWEN_ASR_MODEL_MISMATCH", f"Requested ASR model {model!r} does not match the configured model.", False)
+        resolved_profile, context = _vocabulary_context(vocabularyProfile)
         data = _read_upload(audio)
         with _inference_lock:
             asr, _ = _require_models_loaded()
-            result = _with_audio_file(data, lambda path: asr.transcribe(audio=path, language=_language(language), return_time_stamps=False))
+            result = _with_audio_file(
+                data,
+                lambda path: asr.transcribe(
+                    audio=path,
+                    context=context,
+                    language=_language(language),
+                    return_time_stamps=False,
+                ),
+            )
         if not isinstance(result, list) or len(result) != 1:
             raise GatewayError("QWEN_ASR_INVALID_RESULT", "Qwen ASR returned an invalid result.", False)
         item = result[0]
         text = _as_text(_result_field(item, "text"))
-        return {"text": text, "language": _result_field(item, "language"), "detectedLanguage": _result_field(item, "language"), "model": ASR_MODEL_ID, "serviceVersion": SERVICE_VERSION}
+        return {
+            "text": text,
+            "language": _result_field(item, "language"),
+            "detectedLanguage": _result_field(item, "language"),
+            "model": ASR_MODEL_ID,
+            "vocabularyProfile": resolved_profile,
+            "contextApplied": bool(context),
+            "serviceVersion": SERVICE_VERSION,
+        }
     except GatewayError as exc:
         return _error_response(exc, 401 if exc.code == "QWEN_GATEWAY_UNAUTHORIZED" else 503)
     except Exception as exc:

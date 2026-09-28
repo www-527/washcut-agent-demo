@@ -1,7 +1,7 @@
 import {createHash, createHmac, randomUUID} from 'node:crypto';
 import {lookup} from 'node:dns/promises';
 import {createReadStream} from 'node:fs';
-import {mkdir, open, readFile, rm, stat, writeFile} from 'node:fs/promises';
+import {mkdir, open, rm, stat, writeFile} from 'node:fs/promises';
 import {isIP} from 'node:net';
 import path from 'node:path';
 import {
@@ -103,15 +103,21 @@ export const saveVideoUploadPart = async (store: SqliteStore, session: VideoUplo
   if (contentRange !== `bytes ${start}-${end}/${session.size_bytes}` || bytes.length !== expectedSize) throw new Error('upload_content_range_invalid');
   const digest = createHash('sha256').update(bytes).digest('hex');
   if (!/^[a-f0-9]{64}$/i.test(claimedSha256) || digest !== claimedSha256.toLowerCase()) throw new Error('upload_part_sha256_mismatch');
+  const existing = store.listVideoUploadParts(session.upload_id).find((part) => part.part_number === partNumber);
+  if (existing) {
+    if (existing.sha256 !== digest || existing.size_bytes !== bytes.length) throw new Error('upload_part_conflict');
+    return videoUploadSessionSchema.parse({...session, status: 'uploading', completed_part_numbers: store.listVideoUploadParts(session.upload_id).map((part) => part.part_number), updated_at: new Date().toISOString()});
+  }
   const directory = uploadPartDirectory(session);
   await mkdir(directory, {recursive: true});
   const filePath = path.join(directory, `${String(partNumber).padStart(8, '0')}.part`);
   await writeFile(filePath, bytes);
   store.saveVideoUploadPart({uploadId: session.upload_id, partNumber, sizeBytes: bytes.length, sha256: digest, filePath});
-  const completed = store.listVideoUploadParts(session.upload_id).map((part) => part.part_number);
-  const next = videoUploadSessionSchema.parse({...session, status: 'uploading', completed_part_numbers: completed, updated_at: new Date().toISOString()});
-  store.saveVideoUpload(next);
-  return next;
+  const completed = store.listVideoUploadParts(session.upload_id).map((part) => part.part_number).sort((a, b) => a - b);
+  // `video_upload_parts` is authoritative. The session field is only a
+  // response/cache projection and is intentionally never written here, so
+  // concurrent part uploads cannot overwrite each other's progress.
+  return videoUploadSessionSchema.parse({...session, status: 'uploading', completed_part_numbers: completed, updated_at: new Date().toISOString()});
 };
 
 export const assembleVideoUpload = async (store: SqliteStore, session: VideoUploadSession) => {
@@ -124,11 +130,17 @@ export const assembleVideoUpload = async (store: SqliteStore, session: VideoUplo
   let offset = 0;
   try {
     for (const part of parts) {
-      const bytes = await readFile(part.file_path);
-      if (bytes.length !== part.size_bytes || createHash('sha256').update(bytes).digest('hex') !== part.sha256) throw new Error('upload_part_corrupted');
-      await output.write(bytes, 0, bytes.length, offset);
-      hash.update(bytes);
-      offset += bytes.length;
+      const partHash = createHash('sha256');
+      let partOffset = 0;
+      for await (const chunk of createReadStream(part.file_path)) {
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        partHash.update(bytes);
+        hash.update(bytes);
+        await output.write(bytes, 0, bytes.length, offset);
+        offset += bytes.length;
+        partOffset += bytes.length;
+      }
+      if (partOffset !== part.size_bytes || partHash.digest('hex') !== part.sha256) throw new Error('upload_part_corrupted');
     }
   } finally {
     await output.close();
@@ -235,7 +247,8 @@ export const createTaskForUpload = async (store: SqliteStore, session: VideoUplo
     const existing = store.getVideoAnalysisTask(session.task_id, auth.tenantId);
     if (existing) return existing;
   }
-  if (session.completed_part_numbers.length !== session.total_parts) throw new Error('upload_parts_incomplete');
+  const completedParts = store.listVideoUploadParts(session.upload_id);
+  if (completedParts.length !== session.total_parts || completedParts.some((part, index) => part.part_number !== index + 1)) throw new Error('upload_parts_incomplete');
   const task = await createVideoAnalysisTask(store, {
     auth, projectId: session.project_id, traceId, assetId: `ast_${randomUUID()}`,
     prompt: session.prompt, language: session.language, callbackUrl: session.callback_url, uploadId: session.upload_id,

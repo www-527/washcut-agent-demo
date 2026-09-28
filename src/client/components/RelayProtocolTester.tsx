@@ -21,6 +21,7 @@ export function RelayProtocolTester({context, onClose}: RelayProtocolTesterProps
   const [draggingFiles, setDraggingFiles] = useState(false);
   const [loadingKeys, setLoadingKeys] = useState(true);
   const [sending, setSending] = useState(false);
+  const [sendingElapsedMs, setSendingElapsedMs] = useState(0);
   const [error, setError] = useState('');
   const [result, setResult] = useState<RelayProtocolTestResult>();
 
@@ -43,6 +44,16 @@ export function RelayProtocolTester({context, onClose}: RelayProtocolTesterProps
     window.addEventListener('keydown', closeOnEscape);
     return () => window.removeEventListener('keydown', closeOnEscape);
   }, [onClose, sending]);
+
+  useEffect(() => {
+    if (!sending) {
+      setSendingElapsedMs(0);
+      return;
+    }
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => setSendingElapsedMs(Date.now() - startedAt), 250);
+    return () => window.clearInterval(timer);
+  }, [sending]);
 
   const updateFiles = (nextFiles: File[]) => {
     if (nextFiles.length > 10) { setError('单次最多选择 10 个图片或视频文件。'); return; }
@@ -130,6 +141,11 @@ export function RelayProtocolTester({context, onClose}: RelayProtocolTesterProps
           {result ? <section className="protocol-test-result" aria-live="polite"><div><strong>已收到 <code>response.completed</code></strong><span>{result.model} · {result.latencyMs.toLocaleString('zh-CN')} ms · 视觉输入 {result.inputImageCount} 张（图片 {result.uploadedImageCount} · 视频 {result.uploadedVideoCount}）</span></div><p>{result.reply}</p></section> : null}
 
           <footer><span>请求：<code>POST /v1/responses</code> · <code>stream: true</code> · <code>store: false</code></span><button className="protocol-test-send" type="submit" disabled={sending || loadingKeys || !selectedKeyId || !prompt.trim()}><SparkIcon />{sending ? '正在等待 SSE 完成…' : '发送通信测试'}</button></footer>
+          {sending ? <div className="protocol-test-progress" role="status" aria-live="polite">
+            <div><strong>正在接收中转站 SSE</strong><span>{(sendingElapsedMs / 1_000).toFixed(1)}s</span></div>
+            <p>程序正在逐块读取响应；首字节上限 120s，分块空闲上限 30s，总时长上限 180s。</p>
+            <div className="protocol-test-progress-track" role="progressbar" aria-label="SSE 接收耗时" aria-valuemin={0} aria-valuemax={180_000} aria-valuenow={Math.min(180_000, sendingElapsedMs)}><i style={{width: `${Math.min(100, sendingElapsedMs / 1_800)}%`}} /></div>
+          </div> : null}
         </form>
       </section>
     </div>

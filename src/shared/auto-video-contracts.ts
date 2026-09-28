@@ -27,7 +27,17 @@ export const AUTO_VIDEO_STEP_NAMES = [
   'local_timeline',
 ] as const;
 
-export const AUTO_VIDEO_VISUAL_CONCURRENCY_OPTIONS = [1, 2, 3, 4] as const;
+export const AUTO_VIDEO_MAX_ASSET_COUNT = 50;
+export const AUTO_VIDEO_VISUAL_CONCURRENCY_MIN = 1;
+export const AUTO_VIDEO_VISUAL_CONCURRENCY_MAX = 30;
+export const AUTO_VIDEO_VISUAL_CONCURRENCY_DEFAULT = 1;
+export const AUTO_VIDEO_VISUAL_CONCURRENCY_OPTIONS: readonly number[] = Array.from(
+  {length: AUTO_VIDEO_VISUAL_CONCURRENCY_MAX},
+  (_, index) => index + AUTO_VIDEO_VISUAL_CONCURRENCY_MIN,
+);
+
+export const reasoningEffortSchema = z.enum(['low', 'medium', 'high']);
+export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
 
 export type AutoVideoAiStepName = typeof AUTO_VIDEO_AI_STEP_NAMES[number];
 export type AutoVideoLocalStepName = typeof AUTO_VIDEO_LOCAL_STEP_NAMES[number];
@@ -93,14 +103,19 @@ export const autoVideoErrorSchema = z.object({
   message: z.string().min(1).max(10_000),
   retryable: z.boolean(),
   details: z.string().max(10_000).optional(),
+  stage: z.string().min(1).max(120).optional(),
+  traceId: z.string().min(1).max(200).optional(),
 }).strict();
 export type AutoVideoError = z.infer<typeof autoVideoErrorSchema>;
 
 export const autoVideoRetryStateSchema = z.object({
-  status: z.enum(['none', 'waiting', 'paused_by_user', 'needs_attention']),
-  stage: z.enum(['visual_analysis', 'planning', 'render']).optional(),
+  status: z.enum(['none', 'waiting', 'waiting_for_service', 'paused_by_user', 'needs_attention']),
+  stage: z.enum(['transcription', 'visual_analysis', 'asset_understanding', 'planning', 'render']).optional(),
+  assetId: z.string().min(1).optional(),
   nextRetryAt: z.string().datetime({offset: true}).optional(),
   totalAttempts: z.number().int().nonnegative(),
+  attemptsByKey: z.record(z.string(), z.number().int().nonnegative()).default({}),
+  recoveryAttempts: z.number().int().nonnegative().default(0),
   lastError: autoVideoErrorSchema.optional(),
   updatedAt: z.string().datetime({offset: true}),
 }).strict();
@@ -153,8 +168,6 @@ export const storedAutoVideoAssetSchema = autoVideoAssetSchema.extend({
   tenantId: z.string().min(1),
   ownerId: z.string().min(1),
   originalPath: z.string().min(1),
-  // A duplicated project may safely reference an existing immutable original.
-  sourceAssetId: z.string().min(1).optional(),
   rawTranscriptionPath: z.string().min(1).optional(),
   temporaryAudioPath: z.string().min(1).optional(),
   screenshots: z.array(storedVideoScreenshotSchema).default([]),
@@ -178,7 +191,7 @@ export const transcriptSegmentSchema = z.object({
 }).strict().refine((segment) => segment.startMs < segment.endMs, {message: 'segment_time_invalid'});
 export type TranscriptSegment = z.infer<typeof transcriptSegmentSchema>;
 
-export const transcriptionProviderIdSchema = z.enum(['speaches-whisper', 'qwen3-asr']);
+export const transcriptionProviderIdSchema = z.literal('qwen3-asr');
 export type TranscriptionProviderId = z.infer<typeof transcriptionProviderIdSchema>;
 
 export const transcriptionProviderStatusSchema = z.object({
@@ -205,11 +218,10 @@ export const transcriptionProviderStatusResponseSchema = z.object({
 export type TranscriptionProviderStatusResponse = z.infer<typeof transcriptionProviderStatusResponseSchema>;
 
 export const transcriptionProviderActivationSchema = z.object({
-  providerId: transcriptionProviderIdSchema,
+  providerId: z.literal('qwen3-asr'),
 }).strict();
 export type TranscriptionProviderActivation = z.infer<typeof transcriptionProviderActivationSchema>;
 
-// 'speaches' is retained only for read compatibility with existing SQLite payloads.
 export const normalizedTranscriptSchema = z.object({
   assetId: z.string().min(1),
   language: z.string().min(1).optional(),
@@ -217,7 +229,7 @@ export const normalizedTranscriptSchema = z.object({
   text: z.string(),
   words: z.array(transcriptWordSchema),
   segments: z.array(transcriptSegmentSchema),
-  provider: z.union([transcriptionProviderIdSchema, z.literal('speaches')]).transform((provider) => provider === 'speaches' ? 'speaches-whisper' : provider),
+  provider: transcriptionProviderIdSchema,
   model: z.string().min(1),
 }).strict();
 export type NormalizedTranscript = z.infer<typeof normalizedTranscriptSchema>;
@@ -236,11 +248,31 @@ export const screenshotAnalysisSchema = z.object({
 }).strict();
 export type ScreenshotAnalysis = z.infer<typeof screenshotAnalysisSchema>;
 
+// A clip has exactly one primary job in the final car-wash advertisement.
+// `transition` remains the compatibility default for historical AssetAnalysis
+// records; new roles are assigned only by the whole-generation batch step.
+export const marketingRoleSchema = z.enum([
+  'hook',
+  'problem',
+  'service',
+  'process',
+  'detail',
+  'result',
+  'offer',
+  'cta',
+  'transition',
+]);
+export type MarketingRole = z.infer<typeof marketingRoleSchema>;
+
 export const assetAnalysisSchema = z.object({
   assetId: z.string().min(1),
+  marketingRole: marketingRoleSchema.default('transition'),
   audioSummary: z.string().min(1).optional(),
   visualSummary: z.string().min(1),
   combinedSummary: z.string().min(1),
+  // Optional only for historical generations created before batch role
+  // assignment. Newly assigned roles always persist a non-empty reason.
+  roleReason: z.string().trim().min(1).max(1_000).optional(),
   topics: z.array(z.string()),
   people: z.array(z.string()),
   scenes: z.array(z.string()),
@@ -254,7 +286,7 @@ export type AssetAnalysis = z.infer<typeof assetAnalysisSchema>;
 // This is intentionally a generation-scoped result. It is not attached to an
 // uploaded asset because the connection, prompt snapshot and user instruction
 // can change for every generation.
-export const assetVisualAnalysisSchema = z.object({
+const currentAssetVisualAnalysisSchema = z.object({
   assetId: z.string().min(1),
   visualSummary: z.string().trim().min(1).max(1_500),
   people: z.array(z.string().trim().min(1).max(120)).max(30),
@@ -268,7 +300,52 @@ export const assetVisualAnalysisSchema = z.object({
   detailReason: z.string().trim().min(1).max(300).optional(),
   detailTimestampMs: z.number().int().nonnegative().optional(),
 }).strict();
+
+// Historical checkpoints may contain the retired visual marketingRole (and
+// an even older suggestedPosition). Remove only those known legacy fields;
+// the current visual contract remains strict for every other property.
+export const assetVisualAnalysisSchema = z.preprocess((candidate) => {
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return candidate;
+  const {
+    marketingRole: _legacyMarketingRole,
+    suggestedPosition: _legacySuggestedPosition,
+    ...current
+  } = candidate as Record<string, unknown>;
+  return current;
+}, currentAssetVisualAnalysisSchema);
 export type AssetVisualAnalysis = z.infer<typeof assetVisualAnalysisSchema>;
+
+export const marketingRoleBatchInputAssetSchema = z.object({
+  assetId: z.string().min(1),
+  durationMs: z.number().int().positive(),
+  transcript: z.string(),
+  visualSummary: z.string().trim().min(1).max(1_500),
+  actions: z.array(z.string().trim().min(1).max(160)).max(30),
+  scenes: z.array(z.string().trim().min(1).max(300)).max(20),
+  screenTexts: z.array(z.string().trim().min(1).max(300)).max(30),
+  chronologicalHints: z.array(z.string().trim().min(1).max(300)).max(20),
+}).strict();
+
+export const marketingRoleBatchInputSchema = z.object({
+  schema: z.literal('auto-video-marketing-role-batch-input.v1'),
+  projectId: z.string().min(1),
+  assets: z.array(marketingRoleBatchInputAssetSchema).min(1).max(AUTO_VIDEO_MAX_ASSET_COUNT),
+  userInstruction: z.string().max(2_000),
+}).strict();
+export type MarketingRoleBatchInput = z.infer<typeof marketingRoleBatchInputSchema>;
+
+export const marketingRoleAssignmentSchema = z.object({
+  assetId: z.string().min(1),
+  marketingRole: marketingRoleSchema,
+  roleReason: z.string().trim().min(1).max(1_000),
+}).strict();
+export type MarketingRoleAssignment = z.infer<typeof marketingRoleAssignmentSchema>;
+
+export const marketingRoleBatchResultSchema = z.object({
+  projectId: z.string().min(1),
+  assets: z.array(marketingRoleAssignmentSchema).min(1).max(AUTO_VIDEO_MAX_ASSET_COUNT),
+}).strict();
+export type MarketingRoleBatchResult = z.infer<typeof marketingRoleBatchResultSchema>;
 
 export const checkpointStatusSchema = z.enum(['pending', 'running', 'retry_waiting', 'completed', 'failed']);
 export type CheckpointStatus = z.infer<typeof checkpointStatusSchema>;
@@ -326,10 +403,10 @@ export const analysisProfileSchema = z.discriminatedUnion('name', [
     name: z.literal('balanced-v1'),
     sampledFramesPerAsset: z.literal(3),
     detailBudget: z.number().int().min(0).max(20),
-    modelConcurrency: z.number().int().min(1).max(20),
+    modelConcurrency: z.number().int().min(AUTO_VIDEO_VISUAL_CONCURRENCY_MIN).max(AUTO_VIDEO_VISUAL_CONCURRENCY_MAX),
     // Optional so historical generation snapshots remain readable. New
     // connected generations always record the selected value.
-    visualConcurrency: z.number().int().min(1).max(4).optional(),
+    visualConcurrency: z.number().int().min(AUTO_VIDEO_VISUAL_CONCURRENCY_MIN).max(AUTO_VIDEO_VISUAL_CONCURRENCY_MAX).optional(),
   }).strict(),
   z.object({name: z.literal('legacy-v1')}).strict(),
 ]);
@@ -409,12 +486,17 @@ export const autoVideoOutputSchema = z.object({
   width: z.number().int().positive().optional(),
   height: z.number().int().positive().optional(),
   fileSize: z.number().int().nonnegative().optional(),
+  captionedFileSize: z.number().int().nonnegative().optional(),
   renderedAt: z.string().datetime({offset: true}).optional(),
+  captions: z.enum(['pending', 'ready', 'failed']).default('pending'),
+  plainRender: z.enum(['pending', 'rendering', 'ready', 'failed']).default('pending'),
+  captionedRender: z.enum(['pending', 'rendering', 'ready', 'failed']).default('pending'),
+  inspection: z.enum(['pending', 'ready', 'failed']).default('pending'),
 }).strict();
 export type AutoVideoOutput = z.infer<typeof autoVideoOutputSchema>;
 
 export const transcriptionSelectionSchema = z.object({
-  providerId: transcriptionProviderIdSchema,
+  providerId: z.literal('qwen3-asr'),
 }).strict();
 export type TranscriptionSelection = z.infer<typeof transcriptionSelectionSchema>;
 
@@ -423,7 +505,7 @@ export const transcriptionRunSnapshotSchema = z.object({
   model: z.string().min(1),
   alignmentModel: z.string().min(1).optional(),
   language: z.literal('zh'),
-  vocabularyProfile: z.literal('car-wash-zh-v1'),
+  vocabularyProfile: z.enum(['car-wash-zh-v1', 'car-wash-ad-zh-v2']),
   audioProfile: z.literal('mono-16khz-pcm-s16le-v1'),
   chunkingProfile: z.literal('vad-overlap-30s-v1').optional(),
   providerServiceVersion: z.string().min(1).optional(),
@@ -443,6 +525,8 @@ export const autoVideoGenerationSchema = z.object({
   analysisMetrics: analysisMetricsSchema.optional(),
   connectionId: z.string().min(1).optional(),
   model: z.string().min(1).max(160).optional(),
+  // Captured with the generation so retries keep the same model behavior.
+  reasoningEffort: reasoningEffortSchema.optional(),
   transcriptionSnapshot: transcriptionRunSnapshotSchema.optional(),
   instructionSnapshot: z.string().max(2_000),
   canvas: z.object({
@@ -452,7 +536,7 @@ export const autoVideoGenerationSchema = z.object({
   }).strict(),
   // Historical empty drafts are represented as cancelled V1 records during
   // migration; the generation creation API separately requires a ready asset.
-  assetIds: z.array(z.string().min(1)).max(20),
+  assetIds: z.array(z.string().min(1)).max(AUTO_VIDEO_MAX_ASSET_COUNT),
   steps: z.array(processingStepSchema).min(1),
   transcripts: z.array(normalizedTranscriptSchema).default([]),
   screenshotAnalyses: z.array(screenshotAnalysisSchema).default([]),
@@ -475,10 +559,19 @@ export const autoVideoGenerationCreateSchema = z.object({
   userInstruction: z.string().trim().max(2_000).optional(),
   mode: z.enum(['ai', 'local']).optional(),
   connectionId: z.string().min(1).max(180).optional(),
-  visualConcurrency: z.number().int().min(1).max(4).optional(),
+  // Optional per-generation override. When omitted, the active connection's
+  // saved default model is used.
+  model: z.string().trim().min(1).max(160).optional(),
+  reasoningEffort: reasoningEffortSchema.optional(),
+  visualConcurrency: z.number().int().min(AUTO_VIDEO_VISUAL_CONCURRENCY_MIN).max(AUTO_VIDEO_VISUAL_CONCURRENCY_MAX).optional(),
   transcriptionSelection: transcriptionSelectionSchema.optional(),
 }).strict();
 export type AutoVideoGenerationCreate = z.infer<typeof autoVideoGenerationCreateSchema>;
+
+export const autoVideoGenerationConnectionPatchSchema = z.object({
+  connectionId: z.string().regex(/^key_[a-zA-Z0-9_-]+$/),
+}).strict();
+export type AutoVideoGenerationConnectionPatch = z.infer<typeof autoVideoGenerationConnectionPatchSchema>;
 
 export const autoVideoProjectSchema = z.object({
   id: z.string().min(1),
@@ -493,7 +586,7 @@ export const autoVideoProjectSchema = z.object({
     height: z.number().int().positive(),
     fps: z.number().positive(),
   }).strict(),
-  assetIds: z.array(z.string().min(1)).max(20),
+  assetIds: z.array(z.string().min(1)).max(AUTO_VIDEO_MAX_ASSET_COUNT),
   // These fields are retained only to make old SQLite payloads readable during
   // the one-time migration. New work is always stored on a generation.
   steps: z.array(processingStepSchema).default([]),

@@ -4,6 +4,23 @@
   TranscriptionProviderStatus,
   TranscriptionRunSnapshot,
 } from '../shared/auto-video-contracts.js';
+import {normalizedTranscriptSchema} from '../shared/auto-video-contracts.js';
+
+export const emptyNormalizedTranscript = (
+  assetId: string,
+  durationMs: number,
+  model: string,
+  language = 'zh',
+) => normalizedTranscriptSchema.parse({
+  assetId,
+  language,
+  durationMs,
+  text: '',
+  words: [],
+  segments: [],
+  provider: 'qwen3-asr',
+  model,
+});
 
 export type TranscriptionInput = {
   assetId: string;
@@ -28,6 +45,8 @@ export interface TranscriptionProvider {
   status(): Promise<TranscriptionProviderStatus>;
   start(): Promise<TranscriptionProviderStatus>;
   stop(): Promise<TranscriptionProviderStopResult>;
+  /** Stops a provider-owned local service in addition to releasing its model. */
+  shutdownService?(): Promise<TranscriptionProviderStopResult>;
   createSnapshot?(status?: TranscriptionProviderStatus): TranscriptionRunSnapshot;
   transcribe(input: TranscriptionInput): Promise<NormalizedTranscript>;
   transcribeWithRaw?(input: TranscriptionInput): Promise<TranscriptionResult>;

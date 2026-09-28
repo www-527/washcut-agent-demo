@@ -10,3 +10,6 @@ qwen3-asr-gateway/.venv/
 qwen3-asr-gateway/.env
 qwen3-asr-gateway/__pycache__/
 
+# Local browser sessions and runtime diagnostics
+.runtime-logs/
+

@@ -12,6 +12,24 @@ import {
 } from '../shared/auto-video-contracts.js';
 import {SqliteStore, type StoredAsset} from './store.js';
 
+test('model conversation progress updates keep one readable row', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'washcut-conversation-upsert-'));
+  const database = path.join(directory, 'test.sqlite');
+  const now = new Date().toISOString();
+  const store = new SqliteStore(database, 'test-only-encryption-secret');
+  const base = {
+    id: 'mdl_upsert_test', tenantId: 'tenant_a', ownerId: 'user_a', source: 'relay.chat-test',
+    model: 'gpt-5.6-terra', endpoint: 'https://relay.example.com/v1/responses', startedAt: now,
+    completedAt: now, attempts: 1, requestMessages: [{role: 'user' as const, content: 'hello'}],
+  };
+  store.saveModelConversation({...base, latencyMs: 1, status: 'streaming' as const, responseText: 'part 1'});
+  store.saveModelConversation({...base, latencyMs: 2, status: 'streaming' as const, responseText: 'part 1 part 2'});
+  assert.equal(store.listModelConversations('tenant_a', 'user_a', 'producer').length, 1);
+  assert.equal(store.getModelConversation(base.id, 'tenant_a', 'user_a', 'producer')?.responseText, 'part 1 part 2');
+  store.close();
+  rmSync(directory, {recursive: true, force: true});
+});
+
 test('SQLite persists jobs, events and idempotency while enforcing tenant asset scope', () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'washcut-store-'));
   const database = path.join(directory, 'test.sqlite');
@@ -126,6 +144,15 @@ test('versioned generations are idempotent, ordered, and repair incomplete histo
   delete malformed.progress;
   delete malformed.canvas;
   databaseHandle.prepare('UPDATE auto_video_generations SET payload_json = ? WHERE generation_id = ?').run(JSON.stringify(malformed), v1.generationId);
+  const staleCompleted = {
+    ...v2,
+    status: 'completed',
+    progress: 91,
+    localSummary: 'preserve-completed-payload',
+    completedAt: now,
+  };
+  databaseHandle.prepare('UPDATE auto_video_generations SET status = ?, payload_json = ? WHERE generation_id = ?')
+    .run('completed', JSON.stringify(staleCompleted), v2.generationId);
   databaseHandle.close();
 
   const reopened = new SqliteStore(database, 'test-only-encryption-secret');
@@ -133,6 +160,10 @@ test('versioned generations are idempotent, ordered, and repair incomplete histo
   assert.equal(repaired?.progress, 0);
   assert.deepEqual(repaired?.canvas, project.canvas);
   assert.equal(reopened.getLatestAutoVideoGeneration(project.tenantId, project.ownerId, 'producer', project.id)?.generationId, v2.generationId);
+  const repairedCompleted = reopened.getAutoVideoGeneration(v2.generationId, project.tenantId);
+  assert.equal(repairedCompleted?.progress, 100);
+  assert.equal(repairedCompleted?.localSummary, 'preserve-completed-payload');
+  assert.deepEqual(repairedCompleted?.steps, v2.steps);
   reopened.close();
   rmSync(directory, {recursive: true, force: true});
 });

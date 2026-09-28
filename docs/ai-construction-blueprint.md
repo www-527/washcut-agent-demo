@@ -79,7 +79,6 @@ flowchart LR
 | 草稿项目 | `开始智能编排` | 创建一个新的生成版本并入队 |
 | 已完成版本 | `基于此重新编排` | 使用同一素材和可编辑要求创建新版本 |
 | 已完成版本 | `新建一条视频` | 创建新项目 |
-| 已完成版本 | `复制为新项目` | 复制元数据与要求；素材以引用或受控复制方式复用 |
 | 失败版本 | `从失败步骤重试` | 只重试当前版本的失败步骤 |
 
 完成页不得只显示禁用的“成片已完成”。必须同时显示“新建一条视频”“基于此重新编排”“下载成片”。
@@ -199,7 +198,6 @@ CREATE INDEX idx_generations_scope
 | GET | `/api/projects` | 列出项目摘要，包含 latestGeneration 摘要 |
 | GET | `/api/projects/:projectId` | 项目、素材及版本摘要 |
 | PATCH | `/api/projects/:projectId` | 在没有运行中版本时修改名称、要求或草稿元数据 |
-| POST | `/api/projects/:projectId/duplicate` | 复制为新项目；明确素材复用策略 |
 | POST | `/api/projects/:projectId/archive` | 归档项目，不删除数据 |
 
 ### 6.2 版本 API

@@ -16,6 +16,7 @@ import {
   type VideoUploadSession,
 } from '../shared/contracts.js';
 import {
+  AUTO_VIDEO_MAX_ASSET_COUNT,
   autoVideoGenerationSchema,
   autoVideoAssetCheckpointSchema,
   autoVideoProjectSchema,
@@ -40,19 +41,20 @@ const isRecord = (value: unknown): value is Record<string, unknown> => Boolean(v
 
 /**
  * New contracts deliberately reject unknown fields. Before parsing persisted
- * auto-video data, remove the one retired field emitted by earlier versions.
+ * auto-video data, remove fields retired by earlier versions.
  * This is read-time compatibility only: historical JSON is never rewritten.
  */
 const stripLegacySuggestedPosition = (payload: unknown): unknown => {
   if (!isRecord(payload)) return payload;
-  const assetAnalyses = Array.isArray(payload.assetAnalyses)
-    ? payload.assetAnalyses.map((analysis) => {
+  const {sourceAssetId: _legacySourceAssetId, ...payloadWithoutSourceAssetId} = payload;
+  const assetAnalyses = Array.isArray(payloadWithoutSourceAssetId.assetAnalyses)
+    ? payloadWithoutSourceAssetId.assetAnalyses.map((analysis) => {
       if (!isRecord(analysis)) return analysis;
       const {suggestedPosition: _legacySuggestedPosition, ...withoutLegacyPosition} = analysis;
       return withoutLegacyPosition;
     })
-    : payload.assetAnalyses;
-  const visualAnalysis = isRecord(payload.visualAnalysis) ? payload.visualAnalysis : undefined;
+    : payloadWithoutSourceAssetId.assetAnalyses;
+  const visualAnalysis = isRecord(payloadWithoutSourceAssetId.visualAnalysis) ? payloadWithoutSourceAssetId.visualAnalysis : undefined;
   const visualValue = visualAnalysis && isRecord(visualAnalysis.value) ? visualAnalysis.value : undefined;
   const normalizedVisualAnalysis = visualAnalysis && visualValue
     ? (() => {
@@ -60,10 +62,18 @@ const stripLegacySuggestedPosition = (payload: unknown): unknown => {
       return {...visualAnalysis, value: withoutLegacyPosition};
     })()
     : visualAnalysis;
+  const assets = Array.isArray(payloadWithoutSourceAssetId.assets)
+    ? payloadWithoutSourceAssetId.assets.map((asset) => {
+      if (!isRecord(asset)) return asset;
+      const {sourceAssetId: _legacySourceAssetId, ...withoutSourceAssetId} = asset;
+      return withoutSourceAssetId;
+    })
+    : payloadWithoutSourceAssetId.assets;
   return {
-    ...payload,
-    ...(Array.isArray(payload.assetAnalyses) ? {assetAnalyses} : {}),
+    ...payloadWithoutSourceAssetId,
+    ...(Array.isArray(payloadWithoutSourceAssetId.assetAnalyses) ? {assetAnalyses} : {}),
     ...(normalizedVisualAnalysis ? {visualAnalysis: normalizedVisualAnalysis} : {}),
+    ...(Array.isArray(payloadWithoutSourceAssetId.assets) ? {assets} : {}),
   };
 };
 
@@ -260,7 +270,7 @@ export class SqliteStore {
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_auto_video_assets_scope ON auto_video_assets(tenant_id, project_id, created_at);
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_auto_video_assets_checksum ON auto_video_assets(tenant_id, project_id, checksum);
+      CREATE INDEX IF NOT EXISTS idx_auto_video_assets_checksum ON auto_video_assets(tenant_id, project_id, checksum);
       CREATE TABLE IF NOT EXISTS auto_video_generations (
         generation_id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL,
@@ -328,6 +338,10 @@ export class SqliteStore {
         PRIMARY KEY(tenant_id, key_id)
       );
     `);
+    // Asset identity is clip-scoped; identical uploads are still distinct
+    // clips and must not be silently deduplicated.
+    this.db.exec('DROP INDEX IF EXISTS idx_auto_video_assets_checksum');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_auto_video_assets_checksum ON auto_video_assets(tenant_id, project_id, checksum)');
     // Existing installations created model_conversations before generation
     // auditing existed. SQLite has no ADD COLUMN IF NOT EXISTS, so a duplicate
     // column error is intentionally ignored here.
@@ -373,7 +387,7 @@ export class SqliteStore {
         const updatedAt = normalizedLegacyTimestamp(raw.updatedAt, normalizedLegacyTimestamp(row.updated_at, createdAt));
         const canvas = normalizedLegacyCanvas(raw.canvas);
         const assetIds = Array.isArray(raw.assetIds)
-          ? raw.assetIds.filter((value): value is string => typeof value === 'string' && value.length > 0).slice(0, 20)
+          ? raw.assetIds.filter((value): value is string => typeof value === 'string' && value.length > 0).slice(0, AUTO_VIDEO_MAX_ASSET_COUNT)
           : [];
         const instruction = typeof raw.userInstruction === 'string' ? raw.userInstruction.slice(0, 2_000) : '';
         const name = typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim().slice(0, 80) : '未命名视频编排项目';
@@ -492,7 +506,13 @@ export class SqliteStore {
     for (const row of rows) {
       try {
         const parsedPayload = stripLegacySuggestedPosition(JSON.parse(row.payload_json));
-        if (autoVideoGenerationSchema.safeParse(parsedPayload).success) continue;
+        const validGeneration = autoVideoGenerationSchema.safeParse(parsedPayload);
+        if (validGeneration.success) {
+          if (validGeneration.data.status === 'completed' && validGeneration.data.progress !== 100) {
+            this.saveAutoVideoGeneration({...validGeneration.data, progress: 100});
+          }
+          continue;
+        }
         const raw = parsedPayload && typeof parsedPayload === 'object' && !Array.isArray(parsedPayload)
           ? parsedPayload as Record<string, unknown>
           : {};
@@ -503,7 +523,7 @@ export class SqliteStore {
         const status = typeof raw.status === 'string' && validStatuses.has(raw.status) ? raw.status : validStatuses.has(row.status) ? row.status : 'failed';
         const completed = status === 'completed' || status === 'failed' || status === 'cancelled';
         const assetIds = Array.isArray(raw.assetIds)
-          ? raw.assetIds.filter((value): value is string => typeof value === 'string' && value.length > 0).slice(0, 20)
+          ? raw.assetIds.filter((value): value is string => typeof value === 'string' && value.length > 0).slice(0, AUTO_VIDEO_MAX_ASSET_COUNT)
           : [];
         const instruction = typeof raw.instructionSnapshot === 'string' ? raw.instructionSnapshot.slice(0, 2_000) : project?.userInstruction ?? '';
         const candidate = {
@@ -514,7 +534,11 @@ export class SqliteStore {
           ownerId: row.owner_id,
           versionNumber: row.version_number,
           status,
-          progress: typeof raw.progress === 'number' && Number.isFinite(raw.progress) ? Math.max(0, Math.min(100, Math.round(raw.progress))) : completed ? 100 : 0,
+          progress: status === 'completed'
+            ? 100
+            : typeof raw.progress === 'number' && Number.isFinite(raw.progress)
+              ? Math.max(0, Math.min(100, Math.round(raw.progress)))
+              : completed ? 100 : 0,
           canvas: normalizedLegacyCanvas(raw.canvas ?? project?.canvas),
           assetIds,
           instructionSnapshot: instruction,
@@ -804,25 +828,71 @@ export class SqliteStore {
     return parsed;
   }
 
+  saveAutoVideoAssetsBatch(project: AutoVideoProject, assets: StoredAutoVideoAsset[]) {
+    const parsedProject = autoVideoProjectSchema.parse(project);
+    const parsedAssets = assets.map((asset) => storedAutoVideoAssetSchema.parse(asset));
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const parsed of parsedAssets) {
+        const existing = this.getAutoVideoAsset(parsed.id, parsed.tenantId);
+        if (existing && (existing.originalPath !== parsed.originalPath || existing.checksum !== parsed.checksum)) throw new Error('original_asset_immutable');
+        this.db.prepare(`INSERT INTO auto_video_assets(asset_id, tenant_id, owner_id, project_id, checksum, status, payload_json, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(asset_id) DO UPDATE SET status=excluded.status, payload_json=excluded.payload_json`)
+          .run(parsed.id, parsed.tenantId, parsed.ownerId, parsed.projectId, parsed.checksum, parsed.status, JSON.stringify(parsed), parsed.createdAt);
+      }
+      this.db.prepare(`INSERT INTO auto_video_projects(project_id, tenant_id, owner_id, status, payload_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(project_id) DO UPDATE SET status=excluded.status, payload_json=excluded.payload_json, updated_at=excluded.updated_at`)
+        .run(parsedProject.id, parsedProject.tenantId, parsedProject.ownerId, parsedProject.status, JSON.stringify(parsedProject), parsedProject.createdAt, parsedProject.updatedAt);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    return parsedProject;
+  }
+
   getAutoVideoAsset(assetId: string, tenantId?: string): StoredAutoVideoAsset | undefined {
     const row = tenantId
       ? this.db.prepare('SELECT payload_json FROM auto_video_assets WHERE asset_id = ? AND tenant_id = ?').get(assetId, tenantId)
       : this.db.prepare('SELECT payload_json FROM auto_video_assets WHERE asset_id = ?').get(assetId) as {payload_json: string} | undefined;
-    return row ? storedAutoVideoAssetSchema.parse(JSON.parse((row as {payload_json: string}).payload_json)) : undefined;
+    return row ? storedAutoVideoAssetSchema.parse(stripLegacySuggestedPosition(JSON.parse((row as {payload_json: string}).payload_json))) : undefined;
   }
 
   findAutoVideoAssetByChecksum(tenantId: string, projectId: string, checksum: string): StoredAutoVideoAsset | undefined {
     const row = this.db.prepare('SELECT payload_json FROM auto_video_assets WHERE tenant_id = ? AND project_id = ? AND checksum = ?').get(tenantId, projectId, checksum) as {payload_json: string} | undefined;
-    return row ? storedAutoVideoAssetSchema.parse(JSON.parse(row.payload_json)) : undefined;
+    return row ? storedAutoVideoAssetSchema.parse(stripLegacySuggestedPosition(JSON.parse(row.payload_json))) : undefined;
   }
 
   listAutoVideoAssets(tenantId: string, projectId: string): StoredAutoVideoAsset[] {
     const rows = this.db.prepare('SELECT payload_json FROM auto_video_assets WHERE tenant_id = ? AND project_id = ? ORDER BY created_at').all(tenantId, projectId);
-    return rows.map((row) => storedAutoVideoAssetSchema.parse(JSON.parse((row as {payload_json: string}).payload_json)));
+    return rows.map((row) => storedAutoVideoAssetSchema.parse(stripLegacySuggestedPosition(JSON.parse((row as {payload_json: string}).payload_json))));
   }
 
   deleteAutoVideoAsset(assetId: string, tenantId: string, projectId: string) {
     return this.db.prepare('DELETE FROM auto_video_assets WHERE asset_id = ? AND tenant_id = ? AND project_id = ?').run(assetId, tenantId, projectId).changes > 0;
+  }
+
+  deleteAutoVideoProject(projectId: string, tenantId: string, ownerId?: string) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (this.hasActiveAutoVideoGeneration(tenantId, projectId)) throw new Error('auto_video_project_active');
+      const deleted = ownerId
+        ? this.db.prepare('DELETE FROM auto_video_projects WHERE project_id = ? AND tenant_id = ? AND owner_id = ?').run(projectId, tenantId, ownerId).changes > 0
+        : this.db.prepare('DELETE FROM auto_video_projects WHERE project_id = ? AND tenant_id = ?').run(projectId, tenantId).changes > 0;
+      if (deleted) {
+        this.db.prepare('DELETE FROM auto_video_asset_checkpoints WHERE generation_id IN (SELECT generation_id FROM auto_video_generations WHERE project_id = ? AND tenant_id = ?)').run(projectId, tenantId);
+        this.db.prepare('DELETE FROM model_conversations WHERE project_id = ? AND tenant_id = ?').run(projectId, tenantId);
+        this.db.prepare('DELETE FROM auto_video_generations WHERE project_id = ? AND tenant_id = ?').run(projectId, tenantId);
+        this.db.prepare('DELETE FROM auto_video_assets WHERE project_id = ? AND tenant_id = ?').run(projectId, tenantId);
+      }
+      this.db.exec('COMMIT');
+      return deleted;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   resolveAutoVideoAssets(assetIds: string[], tenantId: string, projectId: string): StoredAutoVideoAsset[] {
@@ -940,9 +1010,26 @@ export class SqliteStore {
 
   saveModelConversation(record: ModelConversationRecord) {
     const parsed = modelConversationRecordSchema.parse(record);
-    this.db.prepare(`INSERT OR REPLACE INTO model_conversations(
+    // Keep progress updates visible to detail readers at every point. SQLite's
+    // INSERT OR REPLACE deletes the existing row before inserting the new one,
+    // which creates a small 404 window while an SSE stream is being persisted.
+    // Use a real upsert so a selected streaming record is never transiently
+    // missing from the detail endpoint.
+    this.db.prepare(`INSERT INTO model_conversations(
       conversation_id, tenant_id, owner_id, project_id, generation_id, job_id, task_id, asset_id, source, status, started_at, payload_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(conversation_id) DO UPDATE SET
+      tenant_id=excluded.tenant_id,
+      owner_id=excluded.owner_id,
+      project_id=excluded.project_id,
+      generation_id=excluded.generation_id,
+      job_id=excluded.job_id,
+      task_id=excluded.task_id,
+      asset_id=excluded.asset_id,
+      source=excluded.source,
+      status=excluded.status,
+      started_at=excluded.started_at,
+      payload_json=excluded.payload_json`)
       .run(
         parsed.id,
         parsed.tenantId,

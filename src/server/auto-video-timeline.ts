@@ -8,6 +8,22 @@ import {
 } from '../shared/auto-video-contracts.js';
 import {signedAutoVideoUrl} from './auto-video-media.js';
 
+/**
+ * Resolve the render canvas from the uploaded media instead of forcing every
+ * generation into the historical 1080x1920 portrait canvas. The first asset
+ * establishes the project output ratio; individual clips still use `contain`
+ * so mixed-ratio uploads are never stretched or cropped.
+ */
+export const resolveAutoVideoCanvas = (
+  fallback: {width: number; height: number; fps: number},
+  assets: Pick<StoredAutoVideoAsset, 'metadata'>[],
+) => {
+  const metadata = assets.find((asset) => asset.metadata)?.metadata;
+  return metadata
+    ? {width: metadata.width, height: metadata.height, fps: fallback.fps}
+    : fallback;
+};
+
 export const validateAutoTimeline = (timeline: VideoTimeline, expectedAssetIds: string[]) => {
   const parsed = videoTimelineSchema.parse(timeline);
   if (parsed.clips.length !== expectedAssetIds.length) throw new Error('TIMELINE_INVALID');

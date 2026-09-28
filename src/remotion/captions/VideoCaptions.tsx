@@ -1,9 +1,37 @@
 import type {Caption} from '@remotion/captions';
 import {AbsoluteFill, Sequence, interpolate, useCurrentFrame, useVideoConfig} from 'remotion';
+import {getShortVideoCaptionLayout} from '../../shared/auto-video-caption';
 
-const CaptionCard = ({caption}: {caption: Caption}) => {
+type CaptionStyle = 'card' | 'short-video';
+
+const CaptionCard = ({caption, style}: {caption: Caption; style: CaptionStyle}) => {
   const frame = useCurrentFrame();
-  const {fps} = useVideoConfig();
+  const {fps, height, width} = useVideoConfig();
+  if (style === 'short-video') {
+    const layout = getShortVideoCaptionLayout(width, height, caption.text);
+    return (
+      <AbsoluteFill style={{justifyContent: 'flex-end', alignItems: 'center', paddingBottom: layout.bottomPx}}>
+        <div
+          style={{
+            maxWidth: layout.maxWidthPx,
+            color: 'white',
+            fontFamily: 'Microsoft YaHei, PingFang SC, Arial, sans-serif',
+            fontSize: layout.fontSizePx,
+            fontWeight: 900,
+            lineHeight: 1.25,
+            letterSpacing: '0.012em',
+            textAlign: 'center',
+            textShadow: `-${layout.strokePx}px -${layout.strokePx}px 0 #090909, ${layout.strokePx}px -${layout.strokePx}px 0 #090909, -${layout.strokePx}px ${layout.strokePx}px 0 #090909, ${layout.strokePx}px ${layout.strokePx}px 0 #090909, 0 ${layout.shadowOffsetPx}px ${layout.shadowBlurPx}px rgba(0,0,0,.72)`,
+            WebkitTextStroke: `${layout.strokePx}px #090909`,
+            paintOrder: 'stroke fill',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {caption.text}
+        </div>
+      </AbsoluteFill>
+    );
+  }
   return (
     <AbsoluteFill style={{justifyContent: 'flex-end', alignItems: 'center', padding: '0 80px 120px'}}>
       <div
@@ -29,7 +57,7 @@ const CaptionCard = ({caption}: {caption: Caption}) => {
   );
 };
 
-export const VideoCaptions = ({captions}: {captions: Caption[]}) => {
+export const VideoCaptions = ({captions, style = 'card'}: {captions: Caption[]; style?: CaptionStyle}) => {
   const {fps} = useVideoConfig();
   return (
     <AbsoluteFill name="Captions">
@@ -38,7 +66,7 @@ export const VideoCaptions = ({captions}: {captions: Caption[]}) => {
         const durationInFrames = Math.max(1, Math.round((caption.endMs - caption.startMs) / 1000 * fps));
         return (
           <Sequence key={`${caption.startMs}-${index}`} from={from} durationInFrames={durationInFrames}>
-            <CaptionCard caption={caption} />
+            <CaptionCard caption={caption} style={style} />
           </Sequence>
         );
       })}

@@ -88,6 +88,25 @@ export function ModelConversationLog({currentProjectId, currentGenerationId, onC
     };
   }, [refresh]);
 
+  // A model request is persisted under one id and replaced in SQLite as each
+  // SSE delta arrives. Poll only while the list contains an active stream so
+  // completed logs keep the same quiet, on-demand behaviour as before.
+  useEffect(() => {
+    if (!conversations.some((conversation) => conversation.status === 'streaming')) return;
+    const timer = window.setInterval(() => { void refresh(); }, 1_000);
+    return () => window.clearInterval(timer);
+  }, [conversations, refresh]);
+
+  useEffect(() => {
+    if (!selectedId || selected?.status !== 'streaming') return;
+    const timer = window.setInterval(() => {
+      void getModelConversation(selectedId).then((detail) => {
+        if (requestVersion.current && selectedId) setSelected(detail);
+      }).catch(() => undefined);
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [selected, selectedId]);
+
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); };
     window.addEventListener('keydown', closeOnEscape);
@@ -147,7 +166,7 @@ export function ModelConversationLog({currentProjectId, currentGenerationId, onC
 
         <div className="model-log-toolbar">
           <label>范围<select value={scope} onChange={(event) => setScope(event.target.value as ScopeFilter)} disabled={!currentProjectId}><option value="generation" disabled={!currentGenerationId}>当前版本</option><option value="project">当前项目</option><option value="all">全部项目</option></select></label>
-          <label>状态<select value={status} onChange={(event) => setStatus(event.target.value as StatusFilter)}><option value="all">全部状态</option><option value="completed">已回复</option><option value="failed">调用失败</option></select></label>
+          <label>状态<select value={status} onChange={(event) => setStatus(event.target.value as StatusFilter)}><option value="all">全部状态</option><option value="streaming">流式接收中</option><option value="completed">已回复</option><option value="failed">调用失败</option></select></label>
           <label>类型<select value={source} onChange={(event) => setSource(event.target.value)}><option value="all">全部类型</option>{sourceOptions.map((item) => <option value={item} key={item}>{sourceLabel(item)}</option>)}</select></label>
           <label className="model-log-search"><span className="sr-only">搜索对话</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索模型、内容或项目" /></label>
           <button type="button" className="model-log-refresh" onClick={() => void refresh()} disabled={loading}>{loading ? '正在读取…' : '刷新'}</button>
@@ -166,7 +185,7 @@ export function ModelConversationLog({currentProjectId, currentGenerationId, onC
                 key={conversation.id}
                 onClick={() => void selectConversation(conversation.id)}
               >
-                <span className={`model-log-status ${conversation.status}`}><i />{conversation.status === 'completed' ? '已回复' : '失败'}</span>
+                <span className={`model-log-status ${conversation.status}`}><i />{conversation.status === 'streaming' ? '流式接收中' : conversation.status === 'completed' ? '已回复' : '失败'}</span>
                 <strong>{sourceLabel(conversation.source)}</strong>
                 <small>{conversation.model} · {formatTime(conversation.startedAt)}</small>
                 <p>{conversation.requestPreview || '（没有可展示的文本输入）'}</p>
@@ -180,7 +199,7 @@ export function ModelConversationLog({currentProjectId, currentGenerationId, onC
             {!detailLoading && !selected ? <div className="model-log-detail-state"><BracketsIcon /><strong>选择一条记录查看完整往返</strong><span>此处会按真实顺序展示程序发送内容与模型原样回复。</span></div> : null}
             {selected ? <>
               <div className="model-log-detail-header">
-                <div><span className={`model-log-status ${selected.status}`}><i />{selected.status === 'completed' ? '模型已回复' : '调用失败'}</span><h3>{sourceLabel(selected.source)}</h3><p>{selected.model} · {formatTime(selected.startedAt)} · {formatLatency(selected.latencyMs)}{selected.attempts > 1 ? ` · 共 ${selected.attempts} 次请求` : ''}</p></div>
+                <div><span className={`model-log-status ${selected.status}`}><i />{selected.status === 'streaming' ? '流式接收中' : selected.status === 'completed' ? '模型已回复' : '调用失败'}</span><h3>{sourceLabel(selected.source)}</h3><p>{selected.model} · {formatTime(selected.startedAt)} · {formatLatency(selected.latencyMs)}{selected.attempts > 1 ? ` · 共 ${selected.attempts} 次请求` : ''}</p></div>
                 <button type="button" className="model-log-copy" onClick={() => void copyConversation()}>复制 JSON</button>
               </div>
               <dl className="model-log-meta">
@@ -189,6 +208,9 @@ export function ModelConversationLog({currentProjectId, currentGenerationId, onC
                 <div><dt>模型端点</dt><dd>{selected.endpoint}</dd></div>
                 {selected.assetId ? <div><dt>素材</dt><dd>{selected.assetId}</dd></div> : null}
                 {selected.taskId || selected.jobId ? <div><dt>任务</dt><dd>{selected.taskId ?? selected.jobId}</dd></div> : null}
+                {selected.timeToFirstByteMs !== undefined ? <div><dt>TTFB</dt><dd>{formatLatency(selected.timeToFirstByteMs)}</dd></div> : null}
+                {selected.timeToFirstEventMs !== undefined ? <div><dt>First event</dt><dd>{formatLatency(selected.timeToFirstEventMs)}</dd></div> : null}
+                {selected.timeoutPhase ? <div><dt>Timeout phase</dt><dd>{selected.timeoutPhase}</dd></div> : null}
               </dl>
               {copyState ? <div className="model-log-copy-state">{copyState}</div> : null}
               <div className="model-log-messages">
@@ -198,7 +220,7 @@ export function ModelConversationLog({currentProjectId, currentGenerationId, onC
                     <pre>{message.content}</pre>
                   </article>
                 ))}
-                {selected.status === 'completed' ? <article className="model-log-message response"><span>模型 → 程序</span><pre>{selected.responseText ?? '（模型没有返回文本）'}</pre></article> : <article className="model-log-message failed"><span>调用错误 · {selected.errorCode ?? 'unknown_error'}</span><pre>{selected.errorMessage ?? '模型调用未完成。'}</pre></article>}
+                {selected.status === 'completed' || selected.status === 'streaming' ? <article className="model-log-message response"><span>{selected.status === 'streaming' ? '模型 → 程序（流式）' : '模型 → 程序'}</span><pre>{selected.responseText ?? (selected.status === 'streaming' ? '等待模型首个文本片段…' : '（模型没有返回文本）')}</pre></article> : <article className="model-log-message failed"><span>调用错误 · {selected.errorCode ?? 'unknown_error'}</span><pre>{selected.errorMessage ?? '模型调用未完成。'}</pre></article>}
               </div>
             </> : null}
           </section>

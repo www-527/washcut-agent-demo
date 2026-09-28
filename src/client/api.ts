@@ -120,8 +120,22 @@ export const retryJob = async (jobId: string, context: EnvelopeContext) => {
   return response.payload.data;
 };
 
+export type SystemShutdownServiceReport = {
+  status: 'stopped' | 'skipped' | 'warning';
+  message: string;
+  code?: string;
+  retryable?: boolean;
+  details?: string;
+};
+
+export type SystemShutdownResult = {
+  accepted: boolean;
+  activeTasksWillResume: boolean;
+  services: {qwen: SystemShutdownServiceReport; docker: SystemShutdownServiceReport};
+};
+
 export const shutdownApp = async (context: EnvelopeContext) => {
-  const response = await requestEnvelope<{accepted: boolean}>('/api/system/shutdown', {type: 'system.shutdown-accepted', schema: 'command-result.v1'}, {
+  const response = await requestEnvelope<SystemShutdownResult>('/api/system/shutdown', {type: 'system.shutdown-accepted', schema: 'command-result.v1'}, {
     method: 'POST', headers: contextHeaders(context),
   });
   return response.payload.data;
@@ -189,6 +203,60 @@ export const chatWithRelayKey = async (keyId: string, messages: RelayChatMessage
     method: 'POST', headers: contextHeaders(context), body: form,
   });
   return response.payload.data;
+};
+
+export const streamChatWithRelayKey = async (
+  keyId: string,
+  messages: RelayChatMessage[],
+  images: File[],
+  context: EnvelopeContext,
+  onDelta: (delta: string) => void,
+  signal?: AbortSignal,
+) => {
+  const form = new FormData();
+  form.append('messages', JSON.stringify(messages));
+  images.forEach((image) => form.append('images', image));
+  const response = await fetch(`/api/keys/${encodeURIComponent(keyId)}/chat?stream=1`, {
+    method: 'POST',
+    headers: {...contextHeaders(context), accept: 'text/event-stream'},
+    body: form,
+    signal,
+  });
+  const rawError = response.ok ? '' : await response.text();
+  if (!response.ok) throw new Error(nativeResponseErrorText(rawError, response.statusText));
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('流式对话响应没有可读取的响应体');
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let completed: RelayChatResult | undefined;
+  const consume = (chunk: string) => {
+    buffer += chunk;
+    const frames = buffer.replace(/\r\n/g, '\n').split('\n\n');
+    buffer = frames.pop() ?? '';
+    for (const frame of frames) {
+      const data = frame.split('\n').filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trimStart()).join('\n');
+      if (!data || data === '[DONE]') continue;
+      const event = JSON.parse(data) as {type?: string; delta?: string; code?: string; message?: string; retryable?: boolean; reply?: string; model?: string; latencyMs?: number};
+      if (event.type === 'delta' && typeof event.delta === 'string') onDelta(event.delta);
+      if (event.type === 'error') throw new Error(`${event.message ?? '模型对话失败'}${event.code ? ` (${event.code})` : ''}`);
+      if (event.type === 'completed' && typeof event.reply === 'string' && typeof event.model === 'string' && typeof event.latencyMs === 'number') {
+        completed = {reply: event.reply, model: event.model, latencyMs: event.latencyMs};
+      }
+    }
+  };
+  while (true) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    if (value?.byteLength) consume(decoder.decode(value, {stream: true}));
+  }
+  consume(decoder.decode());
+  if (buffer.trim()) {
+    const tail = buffer;
+    buffer = '';
+    consume(`${tail}\n\n`);
+  }
+  if (!completed) throw new Error('流式对话未收到完成事件');
+  return completed;
 };
 
 export const testRelayProtocol = async (keyId: string, prompt: string, files: File[], context: EnvelopeContext) => {

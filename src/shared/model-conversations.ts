@@ -1,6 +1,6 @@
 import {z} from 'zod';
 
-export const modelConversationStatusSchema = z.enum(['completed', 'failed']);
+export const modelConversationStatusSchema = z.enum(['streaming', 'completed', 'failed']);
 export type ModelConversationStatus = z.infer<typeof modelConversationStatusSchema>;
 
 export const modelConversationMessageRoleSchema = z.enum(['program', 'user', 'model', 'media']);
@@ -29,6 +29,9 @@ export const modelConversationRecordSchema = z.object({
   startedAt: z.string().datetime({offset: true}),
   completedAt: z.string().datetime({offset: true}),
   latencyMs: z.number().int().nonnegative(),
+  timeToFirstByteMs: z.number().int().nonnegative().optional(),
+  timeToFirstEventMs: z.number().int().nonnegative().optional(),
+  timeoutPhase: z.enum(['first_byte', 'idle', 'total']).optional(),
   attempts: z.number().int().positive().max(8),
   status: modelConversationStatusSchema,
   requestMessages: z.array(modelConversationMessageSchema).min(1).max(32),

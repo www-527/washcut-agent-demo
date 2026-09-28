@@ -3,16 +3,43 @@ import {
   assetAnalysisSchema,
   assetVisualAnalysisSchema,
   editPlanSchema,
+  marketingRoleBatchInputSchema,
+  marketingRoleBatchResultSchema,
+  marketingRoleSchema,
   screenshotAnalysisSchema,
   type AssetAnalysis,
   type AssetVisualAnalysis,
   type AssetMetadata,
   type EditPlan,
+  type MarketingRoleAssignment,
+  type MarketingRoleBatchInput,
+  type MarketingRoleBatchResult,
   type NormalizedTranscript,
   type ScreenshotAnalysis,
   type StoredVideoScreenshot,
 } from '../shared/auto-video-contracts.js';
 import type {ModelConversationLogContext} from '../shared/model-conversations.js';
+import {
+  assetUnderstandingResponseFormat,
+  assetVisualResponseFormat,
+  editPlanResponseFormat,
+  marketingRoleBatchResponseFormat,
+  modelAssetUnderstandingContentSchema,
+  modelAssetVisualContentSchema,
+  modelEditPlanInputSchema,
+  modelEditPlanResultSchema,
+  modelMarketingRoleBatchInputSchema,
+  modelMarketingRoleBatchResultSchema,
+  type ModelEditPlanResult,
+  type ModelMarketingRoleBatchResult,
+} from './auto-video-model-contracts.js';
+import {
+  createModelAssetReferenceMap,
+  toAssetId,
+  toModelClipRef,
+  type ModelAssetReferenceMap,
+  type ModelClipRef,
+} from './model-asset-reference.js';
 import {RelayClient} from './relay-client.js';
 
 export {assetVisualAnalysisSchema};
@@ -70,8 +97,13 @@ export const normalizeVisualModelValue = (input: unknown): {value: unknown; diag
   // Earlier visual contracts asked for a global clip-position guess. It is
   // neither needed nor knowable from one asset, but old model replies can
   // still contain it. Drop only this retired field before strict validation.
-  const {suggestedPosition: legacySuggestedPosition, ...source} = input;
+  const {
+    suggestedPosition: legacySuggestedPosition,
+    marketingRole: legacyMarketingRole,
+    ...source
+  } = input;
   if (legacySuggestedPosition !== undefined) diagnostics.normalizedFields.push('suggestedPosition');
+  if (legacyMarketingRole !== undefined) diagnostics.normalizedFields.push('marketingRole');
   const scenesInput = source.scenes ?? source.scene;
   const normalizedWithLegacyAliases: Record<string, unknown> = {
     ...source,
@@ -89,23 +121,12 @@ export const normalizeVisualModelValue = (input: unknown): {value: unknown; diag
 };
 
 const visualInstructions = `你是视频截图视觉理解模块。你只能根据本次提供的一张截图和可信时间戳描述画面；不要推断未看到的完整视频或音频。返回严格 JSON：description、people、objects、actions、scene、ocrText、qualityIssues。所有数组可以为空，禁止 Markdown。`;
-const assetVisualInstructions = `你是视频素材联合理解模块。你只能根据本次提供的一张本地生成联系表、必要媒体元数据和用户要求做结论；不能读取原片、原始音频或不存在的画面。画面中可见的人、物与动作是唯一的内容判断依据：必须优先描述实际画面行为，不能让口播、转写、字幕或用户要求改变对画面行为的判断。画面内 OCR 文字只能作为辅助线索，也不能推翻可见动作。联系表从左到右依次为 A（早）、B（中）、C（晚），每个面板底部标有其可信时间戳。只返回一个 JSON 对象，不使用 Markdown。字段必须为 assetId、visualSummary、people、objects、actions、scenes、screenTexts、chronologicalHints、confidence、needsDetail、detailReason（可选）、detailTimestampMs（可选）。people、objects、actions、scenes、screenTexts、chronologicalHints 必须是纯文本字符串数组；数组项不得是对象、嵌套数组、数字或 null。confidence 是 0 到 1 的数字。scenes 只用文本描述，绝不返回 location、lighting 等嵌套对象。needsDetail 为 false 时不要返回 detailReason 或 detailTimestampMs。`;
-const detailVisualInstructions = `你是视频素材精查模块。只根据本次提供的一张高精度截图和已有基础分析补充不确定信息。只返回严格 JSON，字段与基础联合理解完全相同。保留 assetId；不能声称看到了未提供的视频、音频或画面。数组必须都是纯文本字符串数组，confidence 是 0 到 1 的数字。`;
-const visualRepairInstructions = `你是结构化输出修复模块。只根据之前的结构化输入和模型回复修正 JSON 字段形状；不能推断、补充或编造媒体内容。只返回一个严格 JSON 对象，不使用 Markdown。people、objects、actions、scenes、screenTexts、chronologicalHints 必须是字符串数组，confidence 为 0 到 1 的数字。`;
-const assetVisualResponseFormat = {
-  name: 'auto_video_asset_visual_analysis',
-  schema: {
-    type: 'object', additionalProperties: false,
-    required: ['assetId', 'visualSummary', 'people', 'objects', 'actions', 'scenes', 'screenTexts', 'chronologicalHints', 'confidence', 'needsDetail'],
-    properties: {
-      assetId: {type: 'string'}, visualSummary: {type: 'string'},
-      people: {type: 'array', items: {type: 'string'}}, objects: {type: 'array', items: {type: 'string'}}, actions: {type: 'array', items: {type: 'string'}}, scenes: {type: 'array', items: {type: 'string'}}, screenTexts: {type: 'array', items: {type: 'string'}}, chronologicalHints: {type: 'array', items: {type: 'string'}},
-      confidence: {type: 'number', minimum: 0, maximum: 1}, needsDetail: {type: 'boolean'}, detailReason: {type: 'string'}, detailTimestampMs: {type: 'integer', minimum: 0},
-    },
-  },
-} as const;
-const understandingInstructions = `你是素材综合理解模块。只读取输入中的转写文字、截图结构化分析、媒体元数据和用户编排要求；你不能读取原始音频或完整视频。判断素材内容和广告作用时，画面行为（截图 description、actions、people、scenes）优先级最高；画面内文字其次；转写只可用于补充已被画面支持的信息，不能覆盖或改写画面结论。返回严格的 AssetAnalysis JSON，字段为 assetId、audioSummary（可省略）、visualSummary、combinedSummary、topics、people、scenes、screenTexts、chronologicalHints、duplicateWithAssetIds、confidence。不要生成代码、文件路径、帧数或不存在的素材 ID。`;
-const planningInstructions = `你是视频自动编排模块。只读取输入的合法素材分析、时长与画布信息。编排时严格按证据优先级决策：1）visualSummary、people、scenes 与 chronologicalHints 中可见的画面行为；2）screenTexts 中的画面内可读文字；3）topics、audioSummary 与 combinedSummary 中的口播/字幕转写。低优先级转写不得推翻画面行为；若两者冲突，以画面行为为准。每个 clips.reason 必须说明该片段的画面行为如何衔接，不要仅复述口播或字幕。第一版必须使用每一个有效素材且每个只能出现一次，excludedAssets 必须为空；clips.order 从 1 开始连续递增。返回严格 EditPlan JSON：projectId、clips（assetId/order/reason）、excludedAssets、overallReason。禁止 JSX、Remotion 代码、Shell 命令、文件路径和帧数。`;
+const assetVisualInstructions = `你是视频素材客观画面理解模块。你只能根据本次提供的一张本地生成联系表、必要媒体元数据和用户要求描述画面证据；不能读取原片、原始音频或不存在的画面，也不要判断素材在广告中的最终叙事作用。画面中可见的人、物与动作是唯一的内容判断依据。画面内 OCR 文字只作为客观画面证据。联系表从左到右依次为 A（早）、B（中）、C（晚），每个面板底部标有其可信时间戳。只返回一个不含任何身份字段的严格 JSON 对象：visualSummary、people、objects、actions、scenes、screenTexts、chronologicalHints、confidence、needsDetail、detailReason（可选）、detailTimestampMs（可选）。不得返回素材 ID、项目 ID、marketingRole 或其他字段。数组项必须是纯文本字符串；confidence 是 0 到 1 的数字。needsDetail 为 false 时不要返回 detailReason 或 detailTimestampMs。`;
+const detailVisualInstructions = `你是视频素材客观画面精查模块。只根据本次提供的一张高精度截图和已有基础分析补充不确定的画面事实。只返回与基础画面理解相同且不含任何身份字段的严格 JSON；不得返回素材 ID、项目 ID 或 marketingRole，也不能声称看到了未提供的视频、音频或画面。`;
+const visualRepairInstructions = `你是结构化输出修复模块。只根据之前的无身份结构化输入和模型回复修正 JSON 字段形状；不能推断、补充或编造媒体内容。只返回与画面理解合同一致且不含任何身份字段的严格 JSON，不使用 Markdown。`;
+const understandingInstructions = `你是素材综合理解模块。只读取输入中的转写文字、截图结构化分析、媒体元数据和用户编排要求；你不能读取原始音频或完整视频。画面行为优先，画面内文字其次，转写只补充不冲突的信息。返回不含任何身份字段的严格 JSON：audioSummary（可省略）、visualSummary、combinedSummary、topics、people、scenes、screenTexts、chronologicalHints、confidence。不要返回素材 ID、项目 ID、其他素材引用、代码、文件路径或帧数。`;
+const marketingRoleBatchInstructions = `你是洗车营销短视频的整批素材作用判断模块。输入只使用 clip_001 等当前任务内短引用。请为每条素材判断主要广告作用，marketingRole 只能是 hook、problem、service、process、detail、result、offer、cta、transition。有效口播的营销意图优先；客观画面用于辅助理解和检查价格、优惠、门店、服务承诺或效果冲突；普通洗车动作可以作为 B-roll，不应覆盖口播作用。不得为了覆盖九类标签而强行分配。必须为每个输入 clipRef 返回且只返回一条结果，不得遗漏、重复、修改或引入其他引用。只返回 clips（clipRef/marketingRole/roleReason）的严格 JSON，不返回项目或素材真实 ID。`;
+const planningInstructions = `你是洗车营销短视频自动编排模块。输入只使用 clip_001 等当前任务内短引用；marketingRole 和 roleReason 是整批判断得到的主要事实。按“吸引注意 → 问题/服务 → 清洗过程 → 细节 → 效果 → 优惠 → 行动引导”的方向组织，但不强求每类都存在。普通音画动作不完全一致可作为 B-roll；涉及价格、优惠、门店、服务承诺或效果的明确冲突必须在 reason 中说明。第一版必须使用每个输入 clipRef 且每个只能出现一次，order 从 1 连续递增并与数组位置一致。只返回 clips（clipRef/order/reason）和 overallReason，不返回项目 ID、素材真实 ID、excludedAssets、代码、路径或帧数。`;
 
 const omitLegacySuggestedPosition = (candidate: unknown): unknown => {
   if (!isRecord(candidate)) return candidate;
@@ -113,33 +134,181 @@ const omitLegacySuggestedPosition = (candidate: unknown): unknown => {
   return withoutLegacyPosition;
 };
 
+type EditPlanValidationError = Error & {code: 'EDIT_PLAN_INVALID'; retryable: false};
+
+const invalidEditPlan = (reasons: string[]): EditPlanValidationError => {
+  const error = new Error(`EDIT_PLAN_INVALID: ${unique(reasons).join('; ')}`) as EditPlanValidationError;
+  error.code = 'EDIT_PLAN_INVALID';
+  error.retryable = false;
+  return error;
+};
+
 export const validateAutoEditPlan = (candidate: unknown, projectId: string, validAssetIds: string[]): EditPlan => {
-  const plan = editPlanSchema.parse(candidate);
-  if (plan.projectId !== projectId) throw new Error('EDIT_PLAN_INVALID');
-  if (plan.excludedAssets.length) throw new Error('EDIT_PLAN_INVALID');
-  if (plan.clips.length !== validAssetIds.length) throw new Error('EDIT_PLAN_INVALID');
+  const parsed = editPlanSchema.safeParse(candidate);
+  if (!parsed.success) throw invalidEditPlan([`invalid internal response shape: ${parsed.error.issues.map((issue) => issue.path.map(String).join('.') || '$').slice(0, 5).join(',')}`]);
+  const plan = parsed.data;
+  const reasons: string[] = [];
+  if (plan.projectId !== projectId) reasons.push('projectId mismatch');
+  if (plan.excludedAssets.length) reasons.push('excludedAssets must be empty');
+  if (plan.clips.length !== validAssetIds.length) reasons.push(`asset count mismatch: expected ${validAssetIds.length}, received ${plan.clips.length}`);
   const expected = new Set(validAssetIds);
+  if (expected.size !== validAssetIds.length) reasons.push('duplicate expected assetId');
   const seen = new Set<string>();
   for (let index = 0; index < plan.clips.length; index += 1) {
     const clip = plan.clips[index]!;
-    if (!expected.has(clip.assetId) || seen.has(clip.assetId) || clip.order !== index + 1) throw new Error('EDIT_PLAN_INVALID');
+    if (!expected.has(clip.assetId)) reasons.push(`unexpected assetId: ${clip.assetId}`);
+    if (seen.has(clip.assetId)) reasons.push(`duplicate assetId: ${clip.assetId}`);
+    if (clip.order !== index + 1) reasons.push(`invalid order for assetId ${clip.assetId}: expected ${index + 1}, received ${clip.order}`);
     seen.add(clip.assetId);
   }
-  if (seen.size !== expected.size) throw new Error('EDIT_PLAN_INVALID');
+  for (const assetId of expected) if (!seen.has(assetId)) reasons.push(`missing assetId: ${assetId}`);
+  if (reasons.length) throw invalidEditPlan(reasons);
   return plan;
 };
 
-const visualFirstSummary = (visualSummary: string, audioSummary?: string) =>
-  audioSummary ? `画面行为：${visualSummary}。语音/字幕（仅辅助）：${audioSummary}` : `画面行为：${visualSummary}`;
+const validateModelClipRefs = (
+  clips: unknown,
+  references: ModelAssetReferenceMap,
+  errorFactory: (reasons: string[]) => Error,
+  checkOrder = false,
+) => {
+  if (!Array.isArray(clips)) throw errorFactory(['clips must be an array']);
+  const reasons: string[] = [];
+  const seen = new Set<string>();
+  clips.forEach((rawClip, index) => {
+    if (!isRecord(rawClip) || typeof rawClip.clipRef !== 'string') {
+      reasons.push(`missing clipRef at index ${index}`);
+      return;
+    }
+    const clipRef = rawClip.clipRef;
+    if (!references.byClipRef.has(clipRef as ModelClipRef)) reasons.push(`unexpected clipRef: ${clipRef}`);
+    if (seen.has(clipRef)) reasons.push(`duplicate clipRef: ${clipRef}`);
+    seen.add(clipRef);
+    if (checkOrder && rawClip.order !== index + 1) {
+      reasons.push(`invalid order for clipRef ${clipRef}: expected ${index + 1}, received ${String(rawClip.order)}`);
+    }
+  });
+  for (const clipRef of references.byClipRef.keys()) if (!seen.has(clipRef)) reasons.push(`missing clipRef: ${clipRef}`);
+  if (clips.length !== references.byClipRef.size
+    && !reasons.some((reason) => /^(missing|duplicate|unexpected) clipRef/.test(reason))) {
+    reasons.push(`clip count mismatch: expected ${references.byClipRef.size}, received ${clips.length}`);
+  }
+  if (reasons.length) throw errorFactory(reasons);
+};
 
-export const toAssetAnalysis = (analysis: AssetVisualAnalysis, transcript: NormalizedTranscript | null): AssetAnalysis => {
+export const validateModelEditPlanCandidate = (
+  candidate: unknown,
+  references: ModelAssetReferenceMap,
+): ModelEditPlanResult => {
+  if (!isRecord(candidate)) throw invalidEditPlan(['response must be an object']);
+  validateModelClipRefs(candidate.clips, references, invalidEditPlan, true);
+  const parsed = modelEditPlanResultSchema.safeParse(candidate);
+  if (!parsed.success) {
+    throw invalidEditPlan([`invalid response shape: ${parsed.error.issues.map((issue) => issue.path.map(String).join('.') || '$').slice(0, 5).join(',')}`]);
+  }
+  return parsed.data;
+};
+
+type MarketingRoleAssignmentError = Error & {code: 'MARKETING_ROLE_ASSIGNMENT_INVALID'; retryable: false};
+
+const invalidMarketingRoleAssignment = (reasons: string[]): MarketingRoleAssignmentError => {
+  const error = new Error(`MARKETING_ROLE_ASSIGNMENT_INVALID: ${unique(reasons).join('; ')}`) as MarketingRoleAssignmentError;
+  error.code = 'MARKETING_ROLE_ASSIGNMENT_INVALID';
+  error.retryable = false;
+  return error;
+};
+
+export const validateMarketingRoleBatchResult = (
+  candidate: unknown,
+  projectId: string,
+  expectedAssetIds: string[],
+): MarketingRoleBatchResult => {
+  const reasons: string[] = [];
+  const expected = new Set(expectedAssetIds);
+  if (expected.size !== expectedAssetIds.length) throw invalidMarketingRoleAssignment(['duplicate expected assetId']);
+  if (!isRecord(candidate)) throw invalidMarketingRoleAssignment(['response must be an object']);
+  if (candidate.projectId !== projectId) reasons.push('projectId mismatch');
+  const rawAssets = candidate.assets;
+  if (!Array.isArray(rawAssets)) throw invalidMarketingRoleAssignment([...reasons, 'assets must be an array']);
+  const seen = new Set<string>();
+  const allowedKeys = new Set(['assetId', 'marketingRole', 'roleReason']);
+  rawAssets.forEach((rawAsset, index) => {
+    if (!isRecord(rawAsset)) {
+      reasons.push(`missing assetId at index ${index}`);
+      return;
+    }
+    const assetId = typeof rawAsset.assetId === 'string' ? rawAsset.assetId.trim() : '';
+    if (!assetId) {
+      reasons.push(`missing assetId at index ${index}`);
+      return;
+    }
+    if (!expected.has(assetId)) reasons.push(`unknown assetId: ${assetId}`);
+    if (seen.has(assetId)) reasons.push(`duplicate assetId: ${assetId}`);
+    seen.add(assetId);
+    if (!marketingRoleSchema.safeParse(rawAsset.marketingRole).success) reasons.push(`invalid marketingRole: ${assetId}`);
+    if (typeof rawAsset.roleReason !== 'string' || !rawAsset.roleReason.trim()) reasons.push(`empty roleReason: ${assetId}`);
+    const unexpected = Object.keys(rawAsset).filter((key) => !allowedKeys.has(key));
+    if (unexpected.length) reasons.push(`unexpected fields for ${assetId}: ${unexpected.join(',')}`);
+  });
+  for (const assetId of expected) if (!seen.has(assetId)) reasons.push(`missing assetId: ${assetId}`);
+  if (rawAssets.length !== expected.size && !reasons.some((reason) => reason.startsWith('missing assetId') || reason.startsWith('duplicate assetId') || reason.startsWith('unknown assetId'))) {
+    reasons.push(`asset count mismatch: expected ${expected.size}, received ${rawAssets.length}`);
+  }
+  const parsed = marketingRoleBatchResultSchema.safeParse(candidate);
+  if (!parsed.success && !reasons.length) {
+    reasons.push(`invalid response shape: ${parsed.error.issues.map((issue) => issue.path.map(String).join('.') || '$').slice(0, 5).join(',')}`);
+  }
+  if (reasons.length || !parsed.success) throw invalidMarketingRoleAssignment(reasons.length ? reasons : ['invalid response shape']);
+  return parsed.data;
+};
+
+const validateModelMarketingRoleBatchResult = (
+  candidate: unknown,
+  references: ModelAssetReferenceMap,
+): ModelMarketingRoleBatchResult => {
+  if (!isRecord(candidate)) throw invalidMarketingRoleAssignment(['response must be an object']);
+  validateModelClipRefs(candidate.clips, references, invalidMarketingRoleAssignment);
+  const parsed = modelMarketingRoleBatchResultSchema.safeParse(candidate);
+  if (!parsed.success) {
+    throw invalidMarketingRoleAssignment([`invalid response shape: ${parsed.error.issues.map((issue) => issue.path.map(String).join('.') || '$').slice(0, 5).join(',')}`]);
+  }
+  return parsed.data;
+};
+
+const metadataForModel = ({assetId: _assetId, ...metadata}: AssetMetadata) => metadata;
+const transcriptForModel = (transcript: NormalizedTranscript | null) => transcript ? {
+  language: transcript.language,
+  durationMs: transcript.durationMs,
+  text: transcript.text,
+  words: transcript.words,
+  segments: transcript.segments,
+  provider: transcript.provider,
+  model: transcript.model,
+} : null;
+const screenshotForModel = ({screenshotId: _screenshotId, assetId: _assetId, ...screenshot}: ScreenshotAnalysis) => screenshot;
+const visualForModel = ({assetId: _assetId, ...analysis}: AssetVisualAnalysis) => analysis;
+const withoutIdentityFields = (candidate: unknown): unknown => {
+  if (Array.isArray(candidate)) return candidate.map(withoutIdentityFields);
+  if (!isRecord(candidate)) return candidate;
+  return Object.fromEntries(Object.entries(candidate)
+    .filter(([key]) => !['projectId', 'generationId', 'assetId'].includes(key))
+    .map(([key, value]) => [key, withoutIdentityFields(value)]));
+};
+
+const narrationFirstSummary = (visualSummary: string, audioSummary?: string) =>
+  audioSummary ? `口播内容：${audioSummary}。客观画面：${visualSummary}` : `无有效口播。客观画面：${visualSummary}`;
+
+export const toAssetAnalysis = (analysis: AssetVisualAnalysis, transcript: NormalizedTranscript | null, assignment: MarketingRoleAssignment): AssetAnalysis => {
+  if (analysis.assetId !== assignment.assetId) throw invalidMarketingRoleAssignment([`assetId mismatch: ${analysis.assetId} != ${assignment.assetId}`]);
   const audioSummary = transcript?.text.trim();
   const visualTopics = unique([...analysis.actions, ...analysis.objects]).slice(0, 20);
   return assetAnalysisSchema.parse({
     assetId: analysis.assetId,
+    marketingRole: assignment.marketingRole,
     audioSummary: audioSummary || undefined,
     visualSummary: analysis.visualSummary,
-    combinedSummary: visualFirstSummary(analysis.visualSummary, audioSummary),
+    combinedSummary: narrationFirstSummary(analysis.visualSummary, audioSummary),
+    roleReason: assignment.roleReason,
     topics: visualTopics.length ? visualTopics : ['视频素材'],
     people: analysis.people,
     scenes: analysis.scenes,
@@ -188,25 +357,25 @@ export class AutoVideoAiProvider {
 
   private parseAssetVisualAnalysis(candidate: unknown, assetId: string, durationMs: number): {analysis: AssetVisualAnalysis; diagnostics: VisualNormalizationDiagnostics} {
     const normalized = normalizeVisualModelValue(candidate);
-    const parsed = assetVisualAnalysisSchema.safeParse(normalized.value);
+    const parsed = modelAssetVisualContentSchema.safeParse(normalized.value);
     if (!parsed.success) {
       const paths = parsed.error.issues.map((issue) => issue.path.length ? issue.path.map(String).join('.') : '$');
       throw new Error(`INVALID_MODEL_RESPONSE:${paths.slice(0, 5).join(',') || '$'}`);
     }
-    if (parsed.data.assetId !== assetId) throw new Error('INVALID_MODEL_RESPONSE:assetId');
-    if (parsed.data.detailTimestampMs !== undefined && parsed.data.detailTimestampMs >= durationMs) throw new Error('INVALID_MODEL_RESPONSE:detailTimestampMs');
-    if (!parsed.data.needsDetail && (parsed.data.detailReason !== undefined || parsed.data.detailTimestampMs !== undefined)) {
-      return {analysis: {...parsed.data, detailReason: undefined, detailTimestampMs: undefined}, diagnostics: normalized.diagnostics};
+    const hydrated = assetVisualAnalysisSchema.parse({assetId, ...parsed.data});
+    if (hydrated.detailTimestampMs !== undefined && hydrated.detailTimestampMs >= durationMs) throw new Error('INVALID_MODEL_RESPONSE:detailTimestampMs');
+    if (!hydrated.needsDetail && (hydrated.detailReason !== undefined || hydrated.detailTimestampMs !== undefined)) {
+      return {analysis: {...hydrated, detailReason: undefined, detailTimestampMs: undefined}, diagnostics: normalized.diagnostics};
     }
-    return {analysis: parsed.data, diagnostics: normalized.diagnostics};
+    return {analysis: hydrated, diagnostics: normalized.diagnostics};
   }
 
   private async repairAssetVisualAnalysis(input: Record<string, unknown>, previousResponse: unknown, assetId: string, durationMs: number, signal?: AbortSignal) {
     if (!this.relay || Math.max(0, Number(process.env.AUTO_VIDEO_VISUAL_MAX_RETRIES ?? 1)) < 1) throw new Error('INVALID_MODEL_RESPONSE');
     const candidate = await this.relay.requestJson(visualRepairInstructions, {
-      schema: 'auto-video-visual-repair.v1',
+      schema: 'auto-video-visual-repair.v2',
       originalInput: input,
-      previousResponse,
+      previousResponse: withoutIdentityFields(previousResponse),
     }, signal, [], this.logContext('auto-video.visual-repair', assetId), assetVisualResponseFormat);
     return this.parseAssetVisualAnalysis(candidate, assetId, durationMs);
   }
@@ -247,9 +416,8 @@ export class AutoVideoAiProvider {
   }): Promise<{analysis: AssetVisualAnalysis; diagnostics: VisualNormalizationDiagnostics}> {
     if (!this.relay) throw new Error('VISUAL_ANALYSIS_FAILED');
     const structuredInput = {
-      schema: 'auto-video-asset-visual-analysis.v1',
-      assetId: input.assetId,
-      metadata: input.metadata,
+      schema: 'auto-video-asset-visual-analysis-input.v2',
+      metadata: metadataForModel(input.metadata),
       contactSheet: {panels: input.panels},
       userInstruction: input.userInstruction,
     };
@@ -280,11 +448,10 @@ export class AutoVideoAiProvider {
   }): Promise<{analysis: AssetVisualAnalysis; diagnostics: VisualNormalizationDiagnostics}> {
     if (!this.relay) throw new Error('VISUAL_ANALYSIS_FAILED');
     const structuredInput = {
-      schema: 'auto-video-asset-visual-detail.v1',
-      assetId: input.assetId,
-      metadata: input.metadata,
+      schema: 'auto-video-asset-visual-detail-input.v2',
+      metadata: metadataForModel(input.metadata),
       detailTimestampMs: input.timestampMs,
-      baseAnalysis: input.baseAnalysis,
+      baseAnalysis: visualForModel(input.baseAnalysis),
       userInstruction: input.userInstruction,
     };
     try {
@@ -334,17 +501,89 @@ export class AutoVideoAiProvider {
     }
     try {
       const candidate = await this.relay.requestJson(understandingInstructions, {
-        schema: 'auto-video-asset-understanding-input.v1',
-        assetId: input.assetId,
-        metadata: input.metadata,
-        transcript: input.transcript,
-        screenshots: input.screenshots,
+        schema: 'auto-video-asset-understanding-input.v2',
+        metadata: metadataForModel(input.metadata),
+        transcript: transcriptForModel(input.transcript),
+        screenshots: input.screenshots.map(screenshotForModel),
         userInstruction: input.userInstruction,
-      }, input.signal, [], this.logContext('auto-video.asset-understanding', input.assetId));
-      const parsed = assetAnalysisSchema.parse(omitLegacySuggestedPosition(candidate));
-      if (parsed.assetId !== input.assetId) throw new Error('INVALID_MODEL_RESPONSE');
-      return assetAnalysisSchema.parse({...parsed, combinedSummary: visualFirstSummary(parsed.visualSummary, parsed.audioSummary)});
+      }, input.signal, [], this.logContext('auto-video.asset-understanding', input.assetId), assetUnderstandingResponseFormat);
+      const content = modelAssetUnderstandingContentSchema.parse(omitLegacySuggestedPosition(candidate));
+      return assetAnalysisSchema.parse({
+        ...content,
+        assetId: input.assetId,
+        marketingRole: 'transition',
+        combinedSummary: narrationFirstSummary(content.visualSummary, content.audioSummary),
+        duplicateWithAssetIds: [],
+      });
     } catch (error) { throw error; }
+  }
+
+  async assignMarketingRolesBatch(input: MarketingRoleBatchInput & {signal?: AbortSignal}): Promise<MarketingRoleBatchResult> {
+    const {signal, ...batchInput} = input;
+    const parsedInput = marketingRoleBatchInputSchema.parse(batchInput);
+    const expectedAssetIds = parsedInput.assets.map((asset) => asset.assetId);
+    if (new Set(expectedAssetIds).size !== expectedAssetIds.length) {
+      throw invalidMarketingRoleAssignment(['duplicate assetId in batch input']);
+    }
+    if (!this.relay) {
+      return marketingRoleBatchResultSchema.parse({
+        projectId: parsedInput.projectId,
+        assets: parsedInput.assets.map((asset) => ({
+          assetId: asset.assetId,
+          marketingRole: 'transition',
+          roleReason: '本地降级：未配置 Relay，无法执行整批语义判断，保留为过渡素材。',
+        })),
+      });
+    }
+
+    const references = createModelAssetReferenceMap(expectedAssetIds);
+    const modelInput = modelMarketingRoleBatchInputSchema.parse({
+      schema: 'auto-video-marketing-role-batch-input.v2',
+      clips: parsedInput.assets.map(({assetId, ...asset}) => ({
+        clipRef: toModelClipRef(references, assetId),
+        ...asset,
+      })),
+      userInstruction: parsedInput.userInstruction,
+    });
+
+    let lastValidationError: MarketingRoleAssignmentError | undefined;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const requestInput = lastValidationError ? {
+        schema: 'auto-video-marketing-role-batch-repair.v2',
+        originalInput: modelInput,
+        validationErrors: lastValidationError.message,
+        instruction: '请依据具体校验错误修正上一轮输出，并重新返回完整结果。',
+      } : modelInput;
+      try {
+        const candidate = await this.relay.requestJson(
+          marketingRoleBatchInstructions,
+          requestInput,
+          signal,
+          [],
+          this.logContext('auto-video.marketing-role-batch'),
+          marketingRoleBatchResponseFormat,
+        );
+        const modelResult = validateModelMarketingRoleBatchResult(candidate, references);
+        return validateMarketingRoleBatchResult({
+          projectId: parsedInput.projectId,
+          assets: modelResult.clips.map((clip) => ({
+            assetId: toAssetId(references, clip.clipRef as ModelClipRef),
+            marketingRole: clip.marketingRole,
+            roleReason: clip.roleReason,
+          })),
+        }, parsedInput.projectId, expectedAssetIds);
+      } catch (error) {
+        const code = error instanceof Error ? (error as {code?: unknown}).code : undefined;
+        if (error instanceof Error && (code === 'MARKETING_ROLE_ASSIGNMENT_INVALID' || code === 'model_invalid_json')) {
+          lastValidationError = (error as Partial<MarketingRoleAssignmentError>).code === 'MARKETING_ROLE_ASSIGNMENT_INVALID'
+            ? error as MarketingRoleAssignmentError
+            : invalidMarketingRoleAssignment(['response is not valid JSON']);
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw lastValidationError ?? invalidMarketingRoleAssignment(['batch role assignment failed validation']);
   }
 
   async plan(input: {
@@ -369,25 +608,78 @@ export class AutoVideoAiProvider {
       }, input.projectId, validAssetIds);
     }
 
-    let repairContext: string | undefined;
+    const references = createModelAssetReferenceMap(validAssetIds);
+    const durationByAssetId = new Map(input.assetDurations.map((asset) => [asset.assetId, asset.durationMs]));
+    if (durationByAssetId.size !== validAssetIds.length) throw invalidEditPlan(['duplicate assetId in assetDurations']);
+    const analysisByAssetId = new Map(input.analyses.map((analysis) => [analysis.assetId, analysis]));
+    if (analysisByAssetId.size !== input.analyses.length) throw invalidEditPlan(['duplicate assetId in analyses']);
+    const analysisIds = new Set(input.analyses.map((analysis) => analysis.assetId));
+    const missingAnalyses = validAssetIds.filter((assetId) => !analysisIds.has(assetId));
+    const unexpectedAnalyses = [...analysisIds].filter((assetId) => !durationByAssetId.has(assetId));
+    if (missingAnalyses.length || unexpectedAnalyses.length) {
+      throw invalidEditPlan([
+        ...missingAnalyses.map((assetId) => `missing analysis for assetId: ${assetId}`),
+        ...unexpectedAnalyses.map((assetId) => `unexpected analysis assetId: ${assetId}`),
+      ]);
+    }
+    const modelInput = modelEditPlanInputSchema.parse({
+      schema: 'auto-video-edit-plan-input.v2',
+      clips: validAssetIds.map((assetId) => {
+        const analysis = analysisByAssetId.get(assetId)!;
+        return {
+          clipRef: toModelClipRef(references, assetId),
+          durationMs: durationByAssetId.get(assetId),
+          marketingRole: analysis.marketingRole,
+          roleReason: analysis.roleReason,
+          audioSummary: analysis.audioSummary,
+          visualSummary: analysis.visualSummary,
+          people: analysis.people,
+          scenes: analysis.scenes,
+          screenTexts: analysis.screenTexts,
+          chronologicalHints: analysis.chronologicalHints,
+        };
+      }),
+      canvas: input.canvas,
+      userInstruction: input.userInstruction,
+      allClipsMustBeUsed: true,
+    });
+
+    let lastValidationError: EditPlanValidationError | undefined;
     for (let attempt = 0; attempt < 3; attempt += 1) {
+      const requestInput = lastValidationError ? {
+        schema: 'auto-video-edit-plan-repair.v2',
+        originalInput: modelInput,
+        validationErrors: lastValidationError.message,
+        instruction: '请依据具体校验错误修正上一轮输出，并重新返回完整结果。',
+      } : modelInput;
       try {
-        const candidate = await this.relay.requestJson(planningInstructions, {
-          schema: 'auto-video-edit-plan-input.v1',
+        const candidate = await this.relay.requestJson(
+          planningInstructions,
+          requestInput,
+          input.signal,
+          [],
+          this.logContext('auto-video.edit-planning'),
+          editPlanResponseFormat,
+        );
+        const modelResult = validateModelEditPlanCandidate(candidate, references);
+        return validateAutoEditPlan({
           projectId: input.projectId,
-          analyses: input.analyses,
-          assetDurations: input.assetDurations,
-          canvas: input.canvas,
-          userInstruction: input.userInstruction,
-          allValidAssetsMustBeUsed: true,
-          repairContext,
-        }, input.signal, [], this.logContext('auto-video.edit-planning'));
-        return validateAutoEditPlan(candidate, input.projectId, validAssetIds);
+          clips: modelResult.clips.map((clip) => ({
+            assetId: toAssetId(references, clip.clipRef as ModelClipRef),
+            order: clip.order,
+            reason: clip.reason,
+          })),
+          excludedAssets: [],
+          overallReason: modelResult.overallReason,
+        }, input.projectId, validAssetIds);
       } catch (error) {
-        if (attempt === 2) break;
-        repairContext = error instanceof Error ? `上一次输出未通过校验：${error.message}。请只返回修正后的严格 JSON。` : '上一次输出未通过校验。';
+        const code = error instanceof Error ? (error as {code?: unknown}).code : undefined;
+        if (code !== 'EDIT_PLAN_INVALID' && code !== 'model_invalid_json') throw error;
+        lastValidationError = code === 'EDIT_PLAN_INVALID'
+          ? error as EditPlanValidationError
+          : invalidEditPlan(['response is not valid JSON']);
       }
     }
-    throw new Error('EDIT_PLAN_INVALID');
+    throw lastValidationError ?? invalidEditPlan(['edit plan failed validation']);
   }
 }
